@@ -1,0 +1,6 @@
+string name
+bool value
+---
+bool success
+int64 sdk_error_code
+string message

@@ -1,0 +1,72 @@
+# Architecture
+
+## Packages
+
+- `hikrobot_mpsdk_vendor`: exposes the external MPSDK headers and `libMPSDK_PUBLIC_COMPAT.so` as a CMake target.
+- `hikrobot_msgs`: custom actions, services, and status messages.
+- `hikrobot_mpsdk_core`: ROS-independent C++17 driver core.
+- `hikrobot_driver`: ROS 2 Humble lifecycle node, actions, services, and state publishers.
+- `hikrobot_bringup`: launch and YAML configuration.
+
+## Lifecycle
+
+`configure`:
+1. create SDK handle
+2. connect controller
+3. subscribe HAR robot status
+4. wait for the first valid state
+5. record original work mode
+
+`activate`:
+1. request control access
+2. switch to PROGRAMMER
+3. eliminate alarms
+4. register legacy motion callback
+5. MotorOff and confirm
+6. set AUTO and verify
+7. MotorOn and confirm
+8. enter realtime motion mode
+9. set equilibrium motion mode
+
+`deactivate`:
+1. reject new goals
+2. request cancellation of the active goal
+3. `MP_StopRealTimeMotion`
+4. `MP_ExitRealTimeMotionMode`
+5. MotorOff
+6. restore original work mode
+7. release control access
+
+`cleanup`:
+1. unsubscribe HAR state
+2. disconnect
+3. destroy SDK handle
+
+## Motion execution
+
+The core serializes all motion commands. MoveJ, MoveL, MoveC and MoveS share the same executor and differ only in SDK parameter construction and completion criteria.
+
+### Sequence collision recovery
+
+The controller V2.1.2 HIL logs showed that a previously executed `nPathID` can survive client process exit. Reusing the same first motion sequence can make `MP_AddMov*Target` return `0x82068043` (`HKR_E_IN_SYS_CALL_REMOTE_FIRET_CMD_REPEAT`).
+
+The driver therefore:
+- never accepts a user supplied `nPathID`;
+- uses one `MotionSequenceManager` shared by all motion types;
+- reserves and persists IDs before calling the SDK;
+- retries only the Add stage when the exact error is `0x82068043`;
+- never automatically repeats a motion after `MP_StartRealTimeMotion` has been attempted successfully, because execution may already have started.
+
+## Units
+
+ROS boundary:
+- joints: rad
+- translation: m
+- orientation: quaternion
+
+MPSDK boundary:
+- rotary joints: degree
+- translation: mm
+- orientation: ZYX Euler degree
+
+HAR completion feedback uses `ST_HAR_ROBOT_STATUS::dJnt[]` and `stBasePose`.

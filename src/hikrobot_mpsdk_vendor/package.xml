@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>hikrobot_mpsdk_vendor</name>
+  <version>0.1.0</version>
+  <description>CMake vendor shim for the externally installed Hikrobot MPSDK.</description>
+  <maintainer email="maintainer@example.com">maintainer</maintainer>
+  <license>Proprietary SDK not redistributed; wrapper code Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

@@ -1,0 +1,16 @@
+std_msgs/Header header
+bool connected
+bool active
+bool state_valid
+bool state_stale
+int32 servo_status
+int32 motion_status
+int32 emergency_status
+int32 controller_status
+int32 safety_gate_status
+int32 robot_motion_mode
+int32 joint_count
+float64 motion_execution_percent
+int32 current_path_id
+int64 last_sdk_error
+string last_error_message

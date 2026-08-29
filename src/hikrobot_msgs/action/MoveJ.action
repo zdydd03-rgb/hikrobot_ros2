@@ -1,0 +1,29 @@
+# Goal
+string[] joint_names
+float64[] positions
+uint8 speed_percent
+uint8 blend_radius
+builtin_interfaces/Duration timeout
+---
+# Result
+uint8 SUCCESS=0
+uint8 INVALID_GOAL=1
+uint8 DRIVER_NOT_READY=2
+uint8 ROBOT_NOT_READY=3
+uint8 BUSY=4
+uint8 SDK_ERROR=5
+uint8 TIMEOUT=6
+uint8 CANCELED=7
+uint8 STATE_LOST=8
+uint8 result_code
+int64 sdk_error_code
+int32 path_id
+builtin_interfaces/Duration execution_time
+string message
+---
+# Feedback
+int32 path_id
+float64 progress_percent
+float64[] target_positions
+float64[] actual_positions
+float64[] position_error

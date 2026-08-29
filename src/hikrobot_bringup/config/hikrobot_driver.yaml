@@ -1,0 +1,28 @@
+hikrobot_driver:
+  ros__parameters:
+    robot_ip: "192.168.2.64"
+    robot_port: 9000
+    har_publish_ms: 50
+
+    joint_names: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+    base_frame: "base_link"
+    tool_frame: "tool0"
+
+    # Password itself is NOT stored here.
+    programmer_password_env: "HIKROBOT_PROGRAMMER_PASSWORD"
+
+    # Empty => $HOME/.ros/hikrobot/path_id.state
+    sequence_state_file: ""
+    sequence_collision_retries: 3
+
+    default_timeout_sec: 30.0
+    joint_tolerance_rad: 0.0034906585   # 0.2 deg
+    position_tolerance_m: 0.001
+    orientation_tolerance_rad: 0.0174532925  # 1 deg
+    stable_samples: 5
+    state_stale_timeout_ms: 1000
+
+    # First-version V2.1.2 compatibility defaults.
+    tool_id: 0
+    workpiece_id: -1
+    state_publish_rate_hz: 20.0
