@@ -98,8 +98,8 @@ int32_t MotionSequenceManager::reserve_block(std::size_t count)
   int64_t next_high = first + static_cast<int64_t>(count) - 1;
 
   if (next_high >= kMaxSequence) {
-    first = 1;
-    next_high = static_cast<int64_t>(count);
+    throw std::overflow_error(
+            "PathID sequence exhausted at limit; refusing to wrap and reuse historical PathIDs");
   }
 
   persist_atomic(static_cast<int32_t>(next_high));
