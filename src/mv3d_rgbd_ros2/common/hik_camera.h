@@ -22,6 +22,7 @@
 #define TYPE_RGB                                   1 << 1
 #define TYPE_LEFT_IR                               1 << 2
 #define TYPE_RIGHT_IR                              1 << 3
+#define TYPE_ALIGNED_DEPTH                         1 << 4
 
 #define TYPE_POINT_CLOUD                           1
 #define TYPE_POINT_CLOUD_WITH_NORMALS              2
@@ -29,6 +30,16 @@
 #define TYPE_TEXTURED_POINT_CLOUD_WITH_NORMALS     4
 
 using namespace std;
+
+enum CameraImageIndex
+{
+    CAMERA_IMAGE_DEPTH = 0,
+    CAMERA_IMAGE_RGB,
+    CAMERA_IMAGE_LEFT_IR,
+    CAMERA_IMAGE_RIGHT_IR,
+    CAMERA_IMAGE_ALIGNED_DEPTH,
+    CAMERA_IMAGE_COUNT
+};
 
 class HikCamera
 {
@@ -65,6 +76,13 @@ public:
 
     // 获取参数
     int getParam(const char* chParam, MV3D_RGBD_PARAM* pstParam);
+
+    // 配置显式的深度坐标系到RGB坐标系映射。必须在设备打开后、开始取流前调用。
+    int configureDepthToRgbAlignment();
+
+    // 获取已回读确认的ImageAlign值和SDK深度单位。
+    int64_t getImageAlignValue() const;
+    float getZUnit() const;
 
     // 获取相机标定参数
     vector<sensor_msgs::msg::CameraInfo> getCamInfo();
@@ -130,6 +148,13 @@ private:
     cv::Mat m_matRgbImg;
     cv::Mat m_matLeftIrImg;
     cv::Mat m_matRightIrImg;
+    cv::Mat m_matAlignedDepthImg;
+    // 显式Depth->RGB映射所需的SDK参数
+    bool m_depthToRgbAlignmentEnabled = false;
+    bool m_alignmentDiagnosticsPrinted = false;
+    int64_t m_imageAlignValue = -1;
+    float m_zUnit = 0.0F;
+    MV3D_RGBD_CAMERA_PARAM m_cameraParam = {};
     // PCL点云图
     pcl::PointCloud<pcl::PointXYZ> m_pclPointCloud;
     pcl::PointCloud<pcl::PointXYZRGB> m_pclTexturedPointCloud;

@@ -82,6 +82,73 @@ int HikCamera::getParam(const char* chParam, MV3D_RGBD_PARAM* pstParam)
     return MV3D_RGBD_GetParam(m_handle, chParam, pstParam);
 }
 
+int HikCamera::configureDepthToRgbAlignment()
+{
+    MV3D_RGBD_PARAM stSetAlign;
+    memset(&stSetAlign, 0, sizeof(stSetAlign));
+    stSetAlign.enParamType = ParamType_Int;
+    stSetAlign.ParamInfo.stIntParam.nCurValue = 0;
+    int nRet = MV3D_RGBD_SetParam(m_handle, MV3D_RGBD_INT_IMAGEALIGN, &stSetAlign);
+    if(MV3D_RGBD_OK != nRet)
+    {
+        LOGE("Set ImageAlign=0 failed...sts[%d]", nRet);
+        return nRet;
+    }
+
+    MV3D_RGBD_PARAM stGetAlign;
+    memset(&stGetAlign, 0, sizeof(stGetAlign));
+    nRet = MV3D_RGBD_GetParam(m_handle, MV3D_RGBD_INT_IMAGEALIGN, &stGetAlign);
+    if(MV3D_RGBD_OK != nRet)
+    {
+        LOGE("Read ImageAlign failed...sts[%d]", nRet);
+        return nRet;
+    }
+    m_imageAlignValue = stGetAlign.ParamInfo.stIntParam.nCurValue;
+    if(0 != m_imageAlignValue)
+    {
+        LOGE("ImageAlign verification failed: expected 0, got %lld",
+            static_cast<long long>(m_imageAlignValue));
+        return MV3D_RGBD_E_PRECONDITION;
+    }
+
+    MV3D_RGBD_PARAM stZUnit;
+    memset(&stZUnit, 0, sizeof(stZUnit));
+    nRet = MV3D_RGBD_GetParam(m_handle, MV3D_RGBD_FLOAT_Z_UNIT, &stZUnit);
+    if(MV3D_RGBD_OK != nRet)
+    {
+        LOGE("Read ZUnit failed...sts[%d]", nRet);
+        return nRet;
+    }
+    m_zUnit = stZUnit.ParamInfo.stFloatParam.fCurValue;
+    if(m_zUnit <= 0.0F)
+    {
+        LOGE("Invalid ZUnit: %f", static_cast<double>(m_zUnit));
+        return MV3D_RGBD_E_PRECONDITION;
+    }
+
+    nRet = MV3D_RGBD_GetCameraParam(m_handle, &m_cameraParam);
+    if(MV3D_RGBD_OK != nRet)
+    {
+        LOGE("Get camera parameters for depth alignment failed...sts[%d]", nRet);
+        return nRet;
+    }
+
+    m_depthToRgbAlignmentEnabled = true;
+    LOGD("ImageAlign verified: %lld", static_cast<long long>(m_imageAlignValue));
+    LOGD("ZUnit: %f", static_cast<double>(m_zUnit));
+    return MV3D_RGBD_OK;
+}
+
+int64_t HikCamera::getImageAlignValue() const
+{
+    return m_imageAlignValue;
+}
+
+float HikCamera::getZUnit() const
+{
+    return m_zUnit;
+}
+
 vector<sensor_msgs::msg::CameraInfo> HikCamera::getCamInfo()
 {
     LOG("------------------------ Get cam info ------------------------");
@@ -184,25 +251,30 @@ void HikCamera::close()
 vector<sensor_msgs::msg::Image::Ptr> HikCamera::getImage()
 {
     m_nMsgImgType = 0;
-    vector<sensor_msgs::msg::Image::Ptr> stImgPtr(4);
+    vector<sensor_msgs::msg::Image::Ptr> stImgPtr(CAMERA_IMAGE_COUNT);
     MV3D_RGBD_FRAME_DATA stFrameData;
+    memset(&stFrameData, 0, sizeof(stFrameData));
     int nRet = MV3D_RGBD_FetchFrame(m_handle, &stFrameData, 5000);
     if(MV3D_RGBD_OK == nRet)
     {
         if(!stFrameData.nValidInfo)
         {
+            MV3D_RGBD_IMAGE_DATA* pstRawDepth = nullptr;
+            const MV3D_RGBD_IMAGE_DATA* pstRgb = nullptr;
             // 根据图像类型进行赋值
             for(int i = 0; i < stFrameData.nImageCount; i++)
             {
                 if(ImageType_Depth == stFrameData.stImageData[i].enImageType)
                 {
+                    pstRawDepth = &stFrameData.stImageData[i];
                     m_matDepthImg = cv::Mat(cv::Size(stFrameData.stImageData[i].nWidth, stFrameData.stImageData[i].nHeight), CV_16UC1, stFrameData.stImageData[i].pData);
-                    stImgPtr[0] = cv_bridge::CvImage(std_msgs::msg::Header(), "mono16", m_matDepthImg).toImageMsg();
+                    stImgPtr[CAMERA_IMAGE_DEPTH] = cv_bridge::CvImage(std_msgs::msg::Header(), "mono16", m_matDepthImg).toImageMsg();
                     m_nMsgImgType |= TYPE_DEPTH;
                     LOGD("SN:%s Get depth image success", m_strSerialNum.c_str());
                 }
                 else if(ImageType_RGB8_Planar == stFrameData.stImageData[i].enImageType || ImageType_YUV422 == stFrameData.stImageData[i].enImageType)
                 {
+                    pstRgb = &stFrameData.stImageData[i];
                     int nDstImageLen = stFrameData.stImageData[i].nWidth * stFrameData.stImageData[i].nHeight * 3;
                     if (nullptr == m_pRgbBuffer || m_nRgbBufferLen < nDstImageLen)
                     {
@@ -229,7 +301,7 @@ vector<sensor_msgs::msg::Image::Ptr> HikCamera::getImage()
                         YUV422_T_RGB(stFrameData.stImageData[i].nWidth, stFrameData.stImageData[i].nHeight, stFrameData.stImageData[i].pData, m_pRgbBuffer);
                     }
                     m_matRgbImg = cv::Mat(cv::Size(stFrameData.stImageData[i].nWidth, stFrameData.stImageData[i].nHeight), CV_8UC3, m_pRgbBuffer);
-                    stImgPtr[1] = cv_bridge::CvImage(std_msgs::msg::Header(), "rgb8", m_matRgbImg).toImageMsg();
+                    stImgPtr[CAMERA_IMAGE_RGB] = cv_bridge::CvImage(std_msgs::msg::Header(), "rgb8", m_matRgbImg).toImageMsg();
                     
                     m_nMsgImgType |= TYPE_RGB;
                     LOGD("SN:%s Get rgb image success", m_strSerialNum.c_str());
@@ -237,20 +309,93 @@ vector<sensor_msgs::msg::Image::Ptr> HikCamera::getImage()
                 else if(StreamType_Ir_Left == stFrameData.stImageData[i].enStreamType)
                 {
                     m_matLeftIrImg = cv::Mat(cv::Size(stFrameData.stImageData[i].nWidth, stFrameData.stImageData[i].nHeight), CV_8UC1, stFrameData.stImageData[i].pData);
-                    stImgPtr[2] = cv_bridge::CvImage(std_msgs::msg::Header(), "mono8", m_matLeftIrImg).toImageMsg();
+                    stImgPtr[CAMERA_IMAGE_LEFT_IR] = cv_bridge::CvImage(std_msgs::msg::Header(), "mono8", m_matLeftIrImg).toImageMsg();
                     m_nMsgImgType |= TYPE_LEFT_IR;
                     LOGD("SN:%s Get left ir image success", m_strSerialNum.c_str());
                 }
                 else if(StreamType_Ir_Right == stFrameData.stImageData[i].enStreamType)
                 {
                     m_matRightIrImg = cv::Mat(cv::Size(stFrameData.stImageData[i].nWidth, stFrameData.stImageData[i].nHeight), CV_8UC1, stFrameData.stImageData[i].pData);
-                    stImgPtr[3] = cv_bridge::CvImage(std_msgs::msg::Header(), "mono8", m_matRightIrImg).toImageMsg();
+                    stImgPtr[CAMERA_IMAGE_RIGHT_IR] = cv_bridge::CvImage(std_msgs::msg::Header(), "mono8", m_matRightIrImg).toImageMsg();
                     m_nMsgImgType |= TYPE_RIGHT_IR;
                     LOGD("SN:%s Get right ir image success", m_strSerialNum.c_str());
                 }
             }
-            m_nFrameNum = stFrameData.stImageData[0].nFrameNum;
-            m_nTimeStamp = stFrameData.stImageData[0].nTimeStamp;
+
+            if(m_depthToRgbAlignmentEnabled && nullptr != pstRawDepth && nullptr != pstRgb)
+            {
+                if(ImageType_Depth != pstRawDepth->enImageType ||
+                    CoordinateType_Depth != pstRawDepth->enCoordinateType)
+                {
+                    RCLCPP_ERROR(rclcpp::get_logger("HikCamera"),
+                        "Skip aligned depth: raw depth type/coordinate invalid (type=%d coordinate=%d)",
+                        static_cast<int>(pstRawDepth->enImageType),
+                        static_cast<int>(pstRawDepth->enCoordinateType));
+                }
+                else
+                {
+                    MV3D_RGBD_IMAGE_DATA stAlignedDepth;
+                    memset(&stAlignedDepth, 0, sizeof(stAlignedDepth));
+                    nRet = MV3D_RGBD_ImageCoordinateTrans(
+                        pstRawDepth, m_zUnit, &stAlignedDepth, &m_cameraParam);
+                    if(MV3D_RGBD_OK != nRet)
+                    {
+                        RCLCPP_ERROR(rclcpp::get_logger("HikCamera"),
+                            "ImageCoordinateTrans failed...sts[%d]", nRet);
+                    }
+                    else if(ImageType_Depth != stAlignedDepth.enImageType ||
+                        CoordinateType_RGB != stAlignedDepth.enCoordinateType)
+                    {
+                        RCLCPP_ERROR(rclcpp::get_logger("HikCamera"),
+                            "Skip aligned depth: SDK output type/coordinate invalid (type=%d coordinate=%d)",
+                            static_cast<int>(stAlignedDepth.enImageType),
+                            static_cast<int>(stAlignedDepth.enCoordinateType));
+                    }
+                    else if(stAlignedDepth.nWidth != pstRgb->nWidth ||
+                        stAlignedDepth.nHeight != pstRgb->nHeight)
+                    {
+                        RCLCPP_ERROR(rclcpp::get_logger("HikCamera"),
+                            "Skip aligned depth: output %ux%u does not match RGB %ux%u",
+                            stAlignedDepth.nWidth, stAlignedDepth.nHeight,
+                            pstRgb->nWidth, pstRgb->nHeight);
+                    }
+                    else if(nullptr == stAlignedDepth.pData ||
+                        static_cast<size_t>(stAlignedDepth.nDataLen) <
+                            static_cast<size_t>(stAlignedDepth.nWidth) *
+                            static_cast<size_t>(stAlignedDepth.nHeight) * sizeof(uint16_t))
+                    {
+                        RCLCPP_ERROR(rclcpp::get_logger("HikCamera"),
+                            "Skip aligned depth: SDK returned an invalid output buffer");
+                    }
+                    else
+                    {
+                        m_matAlignedDepthImg = cv::Mat(
+                            cv::Size(stAlignedDepth.nWidth, stAlignedDepth.nHeight),
+                            CV_16UC1, stAlignedDepth.pData);
+                        stImgPtr[CAMERA_IMAGE_ALIGNED_DEPTH] = cv_bridge::CvImage(
+                            std_msgs::msg::Header(), "mono16", m_matAlignedDepthImg).toImageMsg();
+                        m_nMsgImgType |= TYPE_ALIGNED_DEPTH;
+
+                        if(!m_alignmentDiagnosticsPrinted)
+                        {
+                            LOGD("RGB: %ux%u", pstRgb->nWidth, pstRgb->nHeight);
+                            LOGD("Raw Depth: %ux%u coordinate=%d", pstRawDepth->nWidth,
+                                pstRawDepth->nHeight,
+                                static_cast<int>(pstRawDepth->enCoordinateType));
+                            LOGD("Aligned Depth: %ux%u coordinate=%d encoding=mono16",
+                                stAlignedDepth.nWidth, stAlignedDepth.nHeight,
+                                static_cast<int>(stAlignedDepth.enCoordinateType));
+                            m_alignmentDiagnosticsPrinted = true;
+                        }
+                    }
+                }
+            }
+
+            if(stFrameData.nImageCount > 0)
+            {
+                m_nFrameNum = stFrameData.stImageData[0].nFrameNum;
+                m_nTimeStamp = stFrameData.stImageData[0].nTimeStamp;
+            }
         }
         else
         {
