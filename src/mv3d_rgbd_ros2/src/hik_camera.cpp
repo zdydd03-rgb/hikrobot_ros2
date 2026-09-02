@@ -126,13 +126,9 @@ int HikCamera::configureDepthToRgbAlignment()
         return MV3D_RGBD_E_PRECONDITION;
     }
 
-    nRet = MV3D_RGBD_GetCameraParam(m_handle, &m_cameraParam);
-    if(MV3D_RGBD_OK != nRet)
-    {
-        LOGE("Get camera parameters for depth alignment failed...sts[%d]", nRet);
-        return nRet;
-    }
-
+    // 与海康官方 ImageCoordinateTrans 示例保持一致：
+    // 这里只配置 ImageAlign 和 ZUnit；用于坐标转换的 CameraParam
+    // 在 Start() 之后、每次成功 FetchFrame() 后再获取。
     m_depthToRgbAlignmentEnabled = true;
     LOGD("ImageAlign verified: %lld", static_cast<long long>(m_imageAlignValue));
     LOGD("ZUnit: %f", static_cast<double>(m_zUnit));
@@ -334,58 +330,94 @@ vector<sensor_msgs::msg::Image::Ptr> HikCamera::getImage()
                 }
                 else
                 {
-                    MV3D_RGBD_IMAGE_DATA stAlignedDepth;
-                    memset(&stAlignedDepth, 0, sizeof(stAlignedDepth));
-                    nRet = MV3D_RGBD_ImageCoordinateTrans(
-                        pstRawDepth, m_zUnit, &stAlignedDepth, &m_cameraParam);
+                    // 海康官方 ImageCoordinateTrans demo 的调用顺序是：
+                    // Start -> FetchFrame -> GetCameraParam -> ImageCoordinateTrans。
+                    // 因此这里在当前帧获取成功后重新读取 CameraParam，避免在 Start 前
+                    // 获取到的参数与实际数据流配置/分辨率不一致。
+                    memset(&m_cameraParam, 0, sizeof(m_cameraParam));
+                    nRet = MV3D_RGBD_GetCameraParam(m_handle, &m_cameraParam);
                     if(MV3D_RGBD_OK != nRet)
                     {
                         RCLCPP_ERROR(rclcpp::get_logger("HikCamera"),
-                            "ImageCoordinateTrans failed...sts[%d]", nRet);
+                            "Skip aligned depth: GetCameraParam after FetchFrame failed...sts[%d]",
+                            nRet);
                     }
-                    else if(ImageType_Depth != stAlignedDepth.enImageType ||
-                        CoordinateType_RGB != stAlignedDepth.enCoordinateType)
+                    else if(m_cameraParam.stDepthCalibInfo.nWidth != pstRawDepth->nWidth ||
+                        m_cameraParam.stDepthCalibInfo.nHeight != pstRawDepth->nHeight ||
+                        m_cameraParam.stRgbCalibInfo.nWidth != pstRgb->nWidth ||
+                        m_cameraParam.stRgbCalibInfo.nHeight != pstRgb->nHeight)
                     {
                         RCLCPP_ERROR(rclcpp::get_logger("HikCamera"),
-                            "Skip aligned depth: SDK output type/coordinate invalid (type=%d coordinate=%d)",
-                            static_cast<int>(stAlignedDepth.enImageType),
-                            static_cast<int>(stAlignedDepth.enCoordinateType));
-                    }
-                    else if(stAlignedDepth.nWidth != pstRgb->nWidth ||
-                        stAlignedDepth.nHeight != pstRgb->nHeight)
-                    {
-                        RCLCPP_ERROR(rclcpp::get_logger("HikCamera"),
-                            "Skip aligned depth: output %ux%u does not match RGB %ux%u",
-                            stAlignedDepth.nWidth, stAlignedDepth.nHeight,
+                            "Skip aligned depth: calibration size mismatch "
+                            "Depth calib=%ux%u frame=%ux%u, RGB calib=%ux%u frame=%ux%u",
+                            m_cameraParam.stDepthCalibInfo.nWidth,
+                            m_cameraParam.stDepthCalibInfo.nHeight,
+                            pstRawDepth->nWidth, pstRawDepth->nHeight,
+                            m_cameraParam.stRgbCalibInfo.nWidth,
+                            m_cameraParam.stRgbCalibInfo.nHeight,
                             pstRgb->nWidth, pstRgb->nHeight);
-                    }
-                    else if(nullptr == stAlignedDepth.pData ||
-                        static_cast<size_t>(stAlignedDepth.nDataLen) <
-                            static_cast<size_t>(stAlignedDepth.nWidth) *
-                            static_cast<size_t>(stAlignedDepth.nHeight) * sizeof(uint16_t))
-                    {
-                        RCLCPP_ERROR(rclcpp::get_logger("HikCamera"),
-                            "Skip aligned depth: SDK returned an invalid output buffer");
                     }
                     else
                     {
-                        m_matAlignedDepthImg = cv::Mat(
-                            cv::Size(stAlignedDepth.nWidth, stAlignedDepth.nHeight),
-                            CV_16UC1, stAlignedDepth.pData);
-                        stImgPtr[CAMERA_IMAGE_ALIGNED_DEPTH] = cv_bridge::CvImage(
-                            std_msgs::msg::Header(), "mono16", m_matAlignedDepthImg).toImageMsg();
-                        m_nMsgImgType |= TYPE_ALIGNED_DEPTH;
-
-                        if(!m_alignmentDiagnosticsPrinted)
+                        MV3D_RGBD_IMAGE_DATA stAlignedDepth;
+                        memset(&stAlignedDepth, 0, sizeof(stAlignedDepth));
+                        nRet = MV3D_RGBD_ImageCoordinateTrans(
+                            pstRawDepth, m_zUnit, &stAlignedDepth, &m_cameraParam);
+                        if(MV3D_RGBD_OK != nRet)
                         {
-                            LOGD("RGB: %ux%u", pstRgb->nWidth, pstRgb->nHeight);
-                            LOGD("Raw Depth: %ux%u coordinate=%d", pstRawDepth->nWidth,
-                                pstRawDepth->nHeight,
-                                static_cast<int>(pstRawDepth->enCoordinateType));
-                            LOGD("Aligned Depth: %ux%u coordinate=%d encoding=mono16",
-                                stAlignedDepth.nWidth, stAlignedDepth.nHeight,
+                            RCLCPP_ERROR(rclcpp::get_logger("HikCamera"),
+                                "ImageCoordinateTrans failed...sts[%d]", nRet);
+                        }
+                        else if(ImageType_Depth != stAlignedDepth.enImageType ||
+                            CoordinateType_RGB != stAlignedDepth.enCoordinateType)
+                        {
+                            RCLCPP_ERROR(rclcpp::get_logger("HikCamera"),
+                                "Skip aligned depth: SDK output type/coordinate invalid (type=%d coordinate=%d)",
+                                static_cast<int>(stAlignedDepth.enImageType),
                                 static_cast<int>(stAlignedDepth.enCoordinateType));
-                            m_alignmentDiagnosticsPrinted = true;
+                        }
+                        else if(stAlignedDepth.nWidth != pstRgb->nWidth ||
+                            stAlignedDepth.nHeight != pstRgb->nHeight)
+                        {
+                            RCLCPP_ERROR(rclcpp::get_logger("HikCamera"),
+                                "Skip aligned depth: output %ux%u does not match RGB %ux%u",
+                                stAlignedDepth.nWidth, stAlignedDepth.nHeight,
+                                pstRgb->nWidth, pstRgb->nHeight);
+                        }
+                        else if(nullptr == stAlignedDepth.pData ||
+                            static_cast<size_t>(stAlignedDepth.nDataLen) <
+                                static_cast<size_t>(stAlignedDepth.nWidth) *
+                                static_cast<size_t>(stAlignedDepth.nHeight) * sizeof(uint16_t))
+                        {
+                            RCLCPP_ERROR(rclcpp::get_logger("HikCamera"),
+                                "Skip aligned depth: SDK returned an invalid output buffer");
+                        }
+                        else
+                        {
+                            m_matAlignedDepthImg = cv::Mat(
+                                cv::Size(stAlignedDepth.nWidth, stAlignedDepth.nHeight),
+                                CV_16UC1, stAlignedDepth.pData);
+                            stImgPtr[CAMERA_IMAGE_ALIGNED_DEPTH] = cv_bridge::CvImage(
+                                std_msgs::msg::Header(), "mono16", m_matAlignedDepthImg).toImageMsg();
+                            m_nMsgImgType |= TYPE_ALIGNED_DEPTH;
+
+                            if(!m_alignmentDiagnosticsPrinted)
+                            {
+                                LOGD("RGB: %ux%u", pstRgb->nWidth, pstRgb->nHeight);
+                                LOGD("Raw Depth: %ux%u coordinate=%d", pstRawDepth->nWidth,
+                                    pstRawDepth->nHeight,
+                                    static_cast<int>(pstRawDepth->enCoordinateType));
+                                LOGD("Depth calib: %ux%u",
+                                    m_cameraParam.stDepthCalibInfo.nWidth,
+                                    m_cameraParam.stDepthCalibInfo.nHeight);
+                                LOGD("RGB calib: %ux%u",
+                                    m_cameraParam.stRgbCalibInfo.nWidth,
+                                    m_cameraParam.stRgbCalibInfo.nHeight);
+                                LOGD("Aligned Depth: %ux%u coordinate=%d encoding=mono16",
+                                    stAlignedDepth.nWidth, stAlignedDepth.nHeight,
+                                    static_cast<int>(stAlignedDepth.enCoordinateType));
+                                m_alignmentDiagnosticsPrinted = true;
+                            }
                         }
                     }
                 }

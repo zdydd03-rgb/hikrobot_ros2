@@ -1,6 +1,7 @@
 # hikrobot_ros2
 
-ROS 2 Humble driver for a Hikrobot HAR robot using the public MPSDK legacy motion API.
+ROS 2 Humble drivers for a Hikrobot HAR robot and Hikrobot RGB-D cameras, using
+the public MPSDK legacy motion API and Mv3dRgbdSDK respectively.
 
 ## Verified hardware baseline
 
@@ -11,6 +12,55 @@ ROS 2 Humble driver for a Hikrobot HAR robot using the public MPSDK legacy motio
 - Motion API family: `MP_Motion_API.h` (legacy realtime motion API)
 - HIL verified: connection, HAR state subscription, control access, programmer login, AUTO, MotorOn/Off, realtime mode, MoveJ, common DO read/write
 - SDK/demo-backed and implemented in this repository, pending individual HIL regression: MoveL, MoveC, MoveS, DI read
+
+## ROS packages
+
+In addition to the robot motion driver, this workspace contains the following
+Hikrobot RGB-D camera packages:
+
+### `mv3d_rgbd_ros2`
+
+ROS 2 wrapper and example nodes for the Hikrobot Mv3dRgbdSDK. The package
+connects to a camera by serial number and provides:
+
+- depth, RGB, left IR, and right IR image acquisition and publication;
+- depth images aligned to the RGB optical frame through the SDK
+  `MV3D_RGBD_ImageCoordinateTrans` API;
+- depth and RGB `sensor_msgs/msg/CameraInfo` publication;
+- point-cloud acquisition for XYZ, XYZ + normals, XYZRGB, and XYZRGB + normals;
+- image and point-cloud save clients and servers; and
+- launch files for a single camera, multiple cameras, image capture, and point
+  cloud acquisition.
+
+The image publisher executable is `hik_camera_image_pub`. Its default image
+topics are `/camera/depth`, `/camera/rgb`, `/camera/aligned_depth`,
+`/camera/leftIr`, and `/camera/rightIr`. The aligned-depth topic can be changed
+with the `aligned_depth_topic` parameter. Aligned depth uses `mono16` encoding,
+the RGB image dimensions, and the RGB optical frame ID.
+
+This package expects the Hikrobot Mv3dRgbdSDK under `/opt/Mv3dRgbdSDK` and
+selects the SDK library directory for `x86_64`, `i686`, or `aarch64` during the
+CMake configure step.
+
+### `mv3d_rgbd_ros2_interface`
+
+ROS 2 interface-only package used by `mv3d_rgbd_ros2`. It generates two custom
+services:
+
+- `Image.srv`: transfers the camera serial number, image-type mask, frame
+  number, timestamp, camera calibration, and acquired images to the image-save
+  service.
+- `PointCloud.srv`: transfers the camera serial number, point-cloud type, frame
+  number, timestamp, and `sensor_msgs/msg/PointCloud2` data to the point-cloud
+  save service.
+
+### RGB-D hardware verification
+
+The RGB-D camera integration and the current depth-to-RGB alignment path have
+been verified successfully on physical hardware. The verified alignment flow
+is `Start -> FetchFrame -> GetCameraParam -> ImageCoordinateTrans`; calibration
+dimensions are checked against the acquired depth and RGB frames before each
+coordinate conversion.
 
 ## Build
 
