@@ -93,6 +93,7 @@ void HikrobotDriverNode::create_ros_interfaces()
 {
   joint_pub_ = create_publisher<sensor_msgs::msg::JointState>("/joint_states", rclcpp::SensorDataQoS());
   flange_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>("~/flange_pose", 10);
+  tcp_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>("~/tcp_pose", 10);
   status_pub_ = create_publisher<hikrobot_msgs::msg::RobotStatus>("~/status", 10);
   diagnostics_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 10);
 
@@ -185,6 +186,44 @@ void HikrobotDriverNode::create_ros_interfaces()
       res->sdk_error_code = ret;
       res->message = res->success ? "stop requested" : "MP_StopRealTimeMotion failed";
     });
+
+  get_active_tool_service_ = create_service<hikrobot_msgs::srv::GetActiveTool>(
+    "~/get_active_tool",
+    [this](
+      const std::shared_ptr<hikrobot_msgs::srv::GetActiveTool::Request>,
+      std::shared_ptr<hikrobot_msgs::srv::GetActiveTool::Response> res)
+    {
+      const auto result = core_->get_active_tool();
+      res->success = result.success;
+      res->sdk_error_code = result.sdk_error;
+      res->message = result.message;
+      if (result.success) {
+        {
+          std::lock_guard<std::mutex> lock(active_tool_mutex_);
+          active_tool_cache_ = result.tool;
+          active_tool_valid_ = true;
+        }
+        res->tool = tool_info_to_ros(result.tool);
+      }
+    });
+
+  get_tool_info_list_service_ = create_service<hikrobot_msgs::srv::GetToolInfoList>(
+    "~/get_tool_info_list",
+    [this](
+      const std::shared_ptr<hikrobot_msgs::srv::GetToolInfoList::Request>,
+      std::shared_ptr<hikrobot_msgs::srv::GetToolInfoList::Response> res)
+    {
+      const auto result = core_->get_tool_info_list();
+      res->success = result.success;
+      res->sdk_error_code = result.sdk_error;
+      res->message = result.message;
+      if (result.success) {
+        res->tools.reserve(result.tools.size());
+        for (const auto & tool : result.tools) {
+          res->tools.push_back(tool_info_to_ros(tool));
+        }
+      }
+    });
 }
 
 HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_configure(const rclcpp_lifecycle::State &)
@@ -225,6 +264,12 @@ HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_configure(const rclcpp
     RCLCPP_ERROR(get_logger(), "Core configure failed: %s", error.c_str());
     return CallbackReturn::FAILURE;
   }
+  if (!refresh_active_tool_cache(error)) {
+    RCLCPP_ERROR(get_logger(), "Active Tool load during configure failed: %s", error.c_str());
+    core_->cleanup();
+    clear_active_tool_cache();
+    return CallbackReturn::FAILURE;
+  }
 
   RCLCPP_INFO(
     get_logger(), "Configured: controller=%s:%d, PathID state=%s",
@@ -247,9 +292,16 @@ HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_activate(const rclcpp_
     RCLCPP_ERROR(get_logger(), "Core activate failed: %s", error.c_str());
     return CallbackReturn::FAILURE;
   }
+  if (!refresh_active_tool_cache(error)) {
+    RCLCPP_ERROR(get_logger(), "Active Tool load during activate failed: %s", error.c_str());
+    core_->deactivate();
+    clear_active_tool_cache();
+    return CallbackReturn::FAILURE;
+  }
 
   joint_pub_->on_activate();
   flange_pub_->on_activate();
+  tcp_pub_->on_activate();
   status_pub_->on_activate();
   diagnostics_pub_->on_activate();
   cancel_requested_.store(false);
@@ -269,6 +321,7 @@ HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_deactivate(const rclcp
 
   diagnostics_pub_->on_deactivate();
   status_pub_->on_deactivate();
+  tcp_pub_->on_deactivate();
   flange_pub_->on_deactivate();
   joint_pub_->on_deactivate();
   RCLCPP_INFO(get_logger(), "INACTIVE: realtime exited, MotorOff, original work mode restored");
@@ -281,6 +334,7 @@ HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_cleanup(const rclcpp_l
   cancel_requested_.store(true);
   join_motion_worker();
   core_->cleanup();
+  clear_active_tool_cache();
   goal_reserved_.store(false);
   return CallbackReturn::SUCCESS;
 }
@@ -474,17 +528,79 @@ geometry_msgs::msg::PoseStamped HikrobotDriverNode::state_pose_to_ros(
   geometry_msgs::msg::PoseStamped out;
   out.header.stamp = stamp;
   out.header.frame_id = base_frame_;
-  out.pose.position.x = state.base_pose.x_mm / 1000.0;
-  out.pose.position.y = state.base_pose.y_mm / 1000.0;
-  out.pose.position.z = state.base_pose.z_mm / 1000.0;
-  tf2::Quaternion q;
-  q.setRPY(
-    state.base_pose.roll_deg * kDegToRad,
-    state.base_pose.pitch_deg * kDegToRad,
-    state.base_pose.yaw_deg * kDegToRad);
-  q.normalize();
-  out.pose.orientation = tf2::toMsg(q);
+  out.pose = tool_pose_to_ros(state.base_pose);
   return out;
+}
+
+geometry_msgs::msg::Pose HikrobotDriverNode::tool_pose_to_ros(
+  const hikrobot_mpsdk_core::EulerPose & pose) const
+{
+  geometry_msgs::msg::Pose out;
+  out.position.x = pose.x_mm / 1000.0;
+  out.position.y = pose.y_mm / 1000.0;
+  out.position.z = pose.z_mm / 1000.0;
+  tf2::Quaternion q;
+  q.setRPY(pose.roll_deg * kDegToRad, pose.pitch_deg * kDegToRad, pose.yaw_deg * kDegToRad);
+  q.normalize();
+  out.orientation = tf2::toMsg(q);
+  return out;
+}
+
+geometry_msgs::msg::Pose HikrobotDriverNode::transform_to_ros(
+  const hikrobot_mpsdk_core::RigidTransform & transform) const
+{
+  geometry_msgs::msg::Pose out;
+  out.position.x = transform.x_m;
+  out.position.y = transform.y_m;
+  out.position.z = transform.z_m;
+  out.orientation.x = transform.rotation.x;
+  out.orientation.y = transform.rotation.y;
+  out.orientation.z = transform.rotation.z;
+  out.orientation.w = transform.rotation.w;
+  return out;
+}
+
+hikrobot_msgs::msg::ToolInfo HikrobotDriverNode::tool_info_to_ros(
+  const hikrobot_mpsdk_core::ToolInfo & tool) const
+{
+  hikrobot_msgs::msg::ToolInfo out;
+  out.id = tool.id;
+  out.name = tool.name;
+  out.description = tool.description;
+  out.mount_position = tool.mount_position;
+  out.flange_to_tool = tool_pose_to_ros(tool.flange_to_tool);
+  out.mass = tool.mass;
+  out.mass_center = tool_pose_to_ros(tool.mass_center);
+  out.convex_hull_enabled = tool.convex_hull_enabled;
+  return out;
+}
+
+bool HikrobotDriverNode::refresh_active_tool_cache(std::string & error)
+{
+  const auto result = core_->get_active_tool();
+  if (!result.success) {
+    const auto low32 = static_cast<uint32_t>(static_cast<uint64_t>(result.sdk_error));
+    std::ostringstream oss;
+    oss << result.message << " (sdk=" << result.sdk_error << ", low32=0x" << std::hex << low32 << ')';
+    error = oss.str();
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(active_tool_mutex_);
+    active_tool_cache_ = result.tool;
+    active_tool_valid_ = true;
+  }
+  RCLCPP_INFO(
+    get_logger(), "Active Tool loaded: id=%d, name=%s, mount=%s", result.tool.id,
+    result.tool.name.c_str(), result.tool.mount_position == 0 ? "flange" : "external");
+  return true;
+}
+
+void HikrobotDriverNode::clear_active_tool_cache()
+{
+  std::lock_guard<std::mutex> lock(active_tool_mutex_);
+  active_tool_cache_ = {};
+  active_tool_valid_ = false;
 }
 
 uint8_t HikrobotDriverNode::map_result_code(hikrobot_mpsdk_core::MotionResultCode code) const
@@ -756,6 +872,26 @@ void HikrobotDriverNode::publish_state()
 
   if (state.valid && !state.stale && state.joint_count >= 6) {
     flange_pub_->publish(state_pose_to_ros(state, stamp));
+    hikrobot_mpsdk_core::ToolInfo tool;
+    bool tool_valid = false;
+    {
+      std::lock_guard<std::mutex> lock(active_tool_mutex_);
+      tool = active_tool_cache_;
+      tool_valid = active_tool_valid_;
+    }
+    const auto tcp = hikrobot_mpsdk_core::tcp_transform_if_valid(state, tool_valid, tool);
+    if (tcp) {
+      geometry_msgs::msg::PoseStamped tcp_pose;
+      tcp_pose.header.stamp = stamp;
+      tcp_pose.header.frame_id = base_frame_;
+      tcp_pose.pose = transform_to_ros(*tcp);
+      tcp_pub_->publish(tcp_pose);
+    } else if (!tool_valid || tool.mount_position != 0) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "TCP pose not published: active Tool cache is %s",
+        !tool_valid ? "invalid" : "not flange-mounted");
+    }
   }
 
   hikrobot_msgs::msg::RobotStatus status;

@@ -26,10 +26,13 @@
 #include "hikrobot_msgs/action/move_c.hpp"
 #include "hikrobot_msgs/action/move_s.hpp"
 #include "hikrobot_msgs/msg/robot_status.hpp"
+#include "hikrobot_msgs/msg/tool_info.hpp"
 #include "hikrobot_msgs/srv/set_digital_output.hpp"
 #include "hikrobot_msgs/srv/get_digital_output.hpp"
 #include "hikrobot_msgs/srv/get_digital_input.hpp"
 #include "hikrobot_msgs/srv/stop_motion.hpp"
+#include "hikrobot_msgs/srv/get_active_tool.hpp"
+#include "hikrobot_msgs/srv/get_tool_info_list.hpp"
 #include "hikrobot_mpsdk_core/robot_runtime.hpp"
 
 namespace hikrobot_driver
@@ -89,6 +92,11 @@ private:
     hikrobot_mpsdk_core::EulerPose & output, std::string & error) const;
   geometry_msgs::msg::PoseStamped state_pose_to_ros(
     const hikrobot_mpsdk_core::RobotState & state, const rclcpp::Time & stamp) const;
+  geometry_msgs::msg::Pose tool_pose_to_ros(const hikrobot_mpsdk_core::EulerPose & pose) const;
+  geometry_msgs::msg::Pose transform_to_ros(const hikrobot_mpsdk_core::RigidTransform & transform) const;
+  hikrobot_msgs::msg::ToolInfo tool_info_to_ros(const hikrobot_mpsdk_core::ToolInfo & tool) const;
+  bool refresh_active_tool_cache(std::string & error);
+  void clear_active_tool_cache();
 
   uint8_t map_result_code(hikrobot_mpsdk_core::MotionResultCode code) const;
 
@@ -98,6 +106,9 @@ private:
   std::atomic_bool cancel_requested_{false};
   std::thread motion_worker_;
   mutable std::mutex worker_mutex_;
+  mutable std::mutex active_tool_mutex_;
+  bool active_tool_valid_{false};
+  hikrobot_mpsdk_core::ToolInfo active_tool_cache_{};
 
   std::vector<std::string> joint_names_;
   std::string base_frame_;
@@ -114,6 +125,7 @@ private:
 
   rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::JointState>::SharedPtr joint_pub_;
   rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>::SharedPtr flange_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>::SharedPtr tcp_pub_;
   rclcpp_lifecycle::LifecyclePublisher<hikrobot_msgs::msg::RobotStatus>::SharedPtr status_pub_;
   rclcpp_lifecycle::LifecyclePublisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_pub_;
   rclcpp::TimerBase::SharedPtr state_timer_;
@@ -127,6 +139,8 @@ private:
   rclcpp::Service<hikrobot_msgs::srv::GetDigitalOutput>::SharedPtr get_do_service_;
   rclcpp::Service<hikrobot_msgs::srv::GetDigitalInput>::SharedPtr get_di_service_;
   rclcpp::Service<hikrobot_msgs::srv::StopMotion>::SharedPtr stop_service_;
+  rclcpp::Service<hikrobot_msgs::srv::GetActiveTool>::SharedPtr get_active_tool_service_;
+  rclcpp::Service<hikrobot_msgs::srv::GetToolInfoList>::SharedPtr get_tool_info_list_service_;
 
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;

@@ -22,6 +22,14 @@ Action clients never provide `nPathID`; the driver owns and persists it.
   current Tool TCP pose. The driver publishes it only for valid, non-stale HAR state with at
   least six joints. V0.2-01 timestamps it with the ROS publish time; mapping the original
   HAR/controller sample time is future timestamp-discipline work.
+- `/hikrobot_driver/tcp_pose` (`geometry_msgs/PoseStamped`): `^B T_TCP = ^B T_F × ^F T_Tool`.
+  It is published only for valid non-stale HAR state and a cached flange-mounted active Tool.
+
+`ToolInfo.flange_to_tool` is `^F T_Tool`. Tool data comes from controller read-only APIs;
+SDK mm/degree ZYX Euler values become ROS m/normalized quaternion poses. The Driver exposes
+`/hikrobot_driver/get_active_tool` and `/hikrobot_driver/get_tool_info_list`; neither writes or
+switches Tools. After an external Tool switch, call `get_active_tool` or repeat lifecycle setup.
+No TF is published. Cartesian Action Tool-ID policy remains separate until Base Cartesian contract work.
 - `/hikrobot_driver/status` (`hikrobot_msgs/RobotStatus`)
 - `/diagnostics` (`diagnostic_msgs/DiagnosticArray`)
 

@@ -10,6 +10,7 @@ add_library(
   SHARED
     src/motion_sequence_manager.cpp
     src/robot_runtime.cpp
+    src/tool_transform.cpp
 )
 
 target_compile_features(
@@ -65,5 +66,11 @@ ament_export_dependencies(
   hikrobot_mpsdk_vendor
 )
 ament_export_dependencies(Threads)
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_tool_transform tests/test_tool_transform.cpp)
+  target_link_libraries(test_tool_transform ${PROJECT_NAME})
+endif()
 
 ament_package()

@@ -40,6 +40,8 @@ public:
 
   RobotState robot_state() const;
   MotionState motion_state() const;
+  ToolResult get_active_tool();
+  ToolListResult get_tool_info_list();
 
   MotionResult execute_move_j(
     const MoveJRequest & request,

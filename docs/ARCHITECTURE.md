@@ -73,3 +73,8 @@ HAR completion feedback uses `ST_HAR_ROBOT_STATUS::dJnt[]` and `stBasePose`.
 `stBasePose` is the base-to-flange transform `^B T_F`; it is published as
 `/hikrobot_driver/flange_pose`, not as a Tool TCP pose. V0.2-01 uses the ROS publish time
 for its timestamp; mapping HAR/controller sampling time is deferred to timestamp-discipline work.
+
+The active Tool is read through the controller's read-only Tool APIs and cached by the Driver.
+`^F T_Tool` is converted from SDK mm/ZYX-degree Euler data to ROS m/quaternion, then TCP is
+computed directly from the same HAR snapshot as `^B T_TCP = ^B T_F × ^F T_Tool`. External-mounted
+Tools and invalid caches suppress TCP publication. No Tool write/switch API or TF broadcaster exists.

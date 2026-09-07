@@ -13,10 +13,13 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/MoveC.action"
   "action/MoveS.action"
   "msg/RobotStatus.msg"
+  "msg/ToolInfo.msg"
   "srv/SetDigitalOutput.srv"
   "srv/GetDigitalOutput.srv"
   "srv/GetDigitalInput.srv"
   "srv/StopMotion.srv"
+  "srv/GetActiveTool.srv"
+  "srv/GetToolInfoList.srv"
   DEPENDENCIES builtin_interfaces geometry_msgs std_msgs
 )
 

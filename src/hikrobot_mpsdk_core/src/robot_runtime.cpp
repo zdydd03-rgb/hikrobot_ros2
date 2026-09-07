@@ -141,6 +141,25 @@ void fill_additional_pose(
   out.szAdditionPose[5] = pose.yaw_deg;
 }
 
+ToolInfo tool_from_sdk(const ST_HAR_TOOL & source)
+{
+  ToolInfo out;
+  out.id = source.nID;
+  out.name = bounded_sdk_string(source.szName, sizeof(source.szName));
+  out.description = bounded_sdk_string(source.szDescription, sizeof(source.szDescription));
+  out.mount_position = static_cast<int>(source.eMountPosition);
+  out.flange_to_tool = {
+    source.stBody.stPoseE.dX, source.stBody.stPoseE.dY, source.stBody.stPoseE.dZ,
+    source.stBody.stPoseE.dRoll, source.stBody.stPoseE.dPitch, source.stBody.stPoseE.dYaw};
+  out.mass = source.stBody.dMass;
+  out.mass_center = {
+    source.stBody.stMassCenter.dX, source.stBody.stMassCenter.dY, source.stBody.stMassCenter.dZ,
+    source.stBody.stMassCenter.dRoll, source.stBody.stMassCenter.dPitch,
+    source.stBody.stMassCenter.dYaw};
+  out.convex_hull_enabled = source.eCvxEnable == E_MP_STATUS_ENABLE;
+  return out;
+}
+
 }  // namespace
 
 struct RobotRuntime::Impl
@@ -826,6 +845,77 @@ RobotState RobotRuntime::robot_state() const
 MotionState RobotRuntime::motion_state() const
 {
   return impl_->motion_state_snapshot();
+}
+
+ToolResult RobotRuntime::get_active_tool()
+{
+  ToolResult out;
+  if (!impl_->configured || !impl_->connected || impl_->handle == MP_INVALID_HANDLE) {
+    out.sdk_error = -1;
+    out.message = "runtime is not configured/connected";
+    return out;
+  }
+
+  ST_TOOL_SIMPLE_INFO active{};
+  ST_HAR_TOOL detail{};
+  int64_t ret = E_MP_SUCCESS;
+  {
+    std::lock_guard<std::mutex> lock(impl_->sdk_mutex);
+    ret = MP_GetActivateTool(impl_->handle, &active);
+    if (ret == E_MP_SUCCESS && !valid_tool_id(active.nToolID)) {
+      out.sdk_error = -1;
+      out.message = "MP_GetActivateTool returned out-of-range Tool ID";
+      return out;
+    }
+    if (ret == E_MP_SUCCESS) {
+      ST_TOOL_INDEX index{};
+      index.nToolID = active.nToolID;
+      ret = MP_HAR_GetToolInfo(impl_->handle, &index, &detail);
+    }
+  }
+  if (ret != E_MP_SUCCESS) {
+    out.sdk_error = ret;
+    out.message = "Tool read failed: " + hex_error(ret);
+    return out;
+  }
+  out.success = true;
+  out.tool = tool_from_sdk(detail);
+  out.message = "ok";
+  return out;
+}
+
+ToolListResult RobotRuntime::get_tool_info_list()
+{
+  ToolListResult out;
+  if (!impl_->configured || !impl_->connected || impl_->handle == MP_INVALID_HANDLE) {
+    out.sdk_error = -1;
+    out.message = "runtime is not configured/connected";
+    return out;
+  }
+
+  ST_HAR_TOOL_LIST list{};
+  int64_t ret = E_MP_SUCCESS;
+  {
+    std::lock_guard<std::mutex> lock(impl_->sdk_mutex);
+    ret = MP_HAR_GetToolInfoList(impl_->handle, &list);
+  }
+  if (ret != E_MP_SUCCESS) {
+    out.sdk_error = ret;
+    out.message = "MP_HAR_GetToolInfoList failed: " + hex_error(ret);
+    return out;
+  }
+  if (!valid_tool_count(list.nNum)) {
+    out.sdk_error = -1;
+    out.message = "MP_HAR_GetToolInfoList returned out-of-range tool count";
+    return out;
+  }
+  out.tools.reserve(static_cast<std::size_t>(list.nNum));
+  for (int32_t i = 0; i < list.nNum; ++i) {
+    out.tools.push_back(tool_from_sdk(list.szTool[i]));
+  }
+  out.success = true;
+  out.message = "ok";
+  return out;
 }
 
 MotionResult RobotRuntime::execute_move_j(

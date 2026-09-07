@@ -2,8 +2,10 @@
 
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -19,6 +21,56 @@ struct EulerPose
   double pitch_deg{0.0};
   double yaw_deg{0.0};
 };
+
+struct ToolInfo
+{
+  int32_t id{0};
+  std::string name;
+  std::string description;
+  int mount_position{0};
+  EulerPose flange_to_tool{};
+  double mass{0.0};
+  EulerPose mass_center{};
+  bool convex_hull_enabled{false};
+};
+
+struct ToolResult
+{
+  bool success{false};
+  int64_t sdk_error{0};
+  ToolInfo tool{};
+  std::string message;
+};
+
+struct ToolListResult
+{
+  bool success{false};
+  int64_t sdk_error{0};
+  std::vector<ToolInfo> tools;
+  std::string message;
+};
+
+struct Quaternion
+{
+  double x{0.0};
+  double y{0.0};
+  double z{0.0};
+  double w{1.0};
+};
+
+struct RigidTransform
+{
+  double x_m{0.0};
+  double y_m{0.0};
+  double z_m{0.0};
+  Quaternion rotation{};
+};
+
+RigidTransform euler_pose_to_transform(const EulerPose & pose);
+RigidTransform compose_transforms(const RigidTransform & lhs, const RigidTransform & rhs);
+bool valid_tool_id(int32_t id);
+bool valid_tool_count(int32_t count);
+std::string bounded_sdk_string(const char * value, std::size_t capacity);
 
 struct RobotState
 {
@@ -36,6 +88,9 @@ struct RobotState
   double motion_execution_percent{0.0};
   std::chrono::steady_clock::time_point received_at{};
 };
+
+std::optional<RigidTransform> tcp_transform_if_valid(
+  const RobotState & robot, bool active_tool_valid, const ToolInfo & active_tool);
 
 struct MotionState
 {
