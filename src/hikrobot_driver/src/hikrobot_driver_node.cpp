@@ -92,7 +92,7 @@ void HikrobotDriverNode::declare_parameters()
 void HikrobotDriverNode::create_ros_interfaces()
 {
   joint_pub_ = create_publisher<sensor_msgs::msg::JointState>("/joint_states", rclcpp::SensorDataQoS());
-  tcp_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>("~/tcp_pose", 10);
+  flange_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>("~/flange_pose", 10);
   status_pub_ = create_publisher<hikrobot_msgs::msg::RobotStatus>("~/status", 10);
   diagnostics_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 10);
 
@@ -249,7 +249,7 @@ HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_activate(const rclcpp_
   }
 
   joint_pub_->on_activate();
-  tcp_pub_->on_activate();
+  flange_pub_->on_activate();
   status_pub_->on_activate();
   diagnostics_pub_->on_activate();
   cancel_requested_.store(false);
@@ -269,7 +269,7 @@ HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_deactivate(const rclcp
 
   diagnostics_pub_->on_deactivate();
   status_pub_->on_deactivate();
-  tcp_pub_->on_deactivate();
+  flange_pub_->on_deactivate();
   joint_pub_->on_deactivate();
   RCLCPP_INFO(get_logger(), "INACTIVE: realtime exited, MotorOff, original work mode restored");
   return CallbackReturn::SUCCESS;
@@ -752,7 +752,10 @@ void HikrobotDriverNode::publish_state()
       joint.position[i] = state.joints_deg[i] * kDegToRad;
     }
     joint_pub_->publish(joint);
-    tcp_pub_->publish(state_pose_to_ros(state, stamp));
+  }
+
+  if (state.valid && !state.stale && state.joint_count >= 6) {
+    flange_pub_->publish(state_pose_to_ros(state, stamp));
   }
 
   hikrobot_msgs::msg::RobotStatus status;

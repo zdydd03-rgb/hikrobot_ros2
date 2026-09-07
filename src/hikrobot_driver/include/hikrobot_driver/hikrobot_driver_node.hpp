@@ -113,7 +113,7 @@ private:
   int workpiece_id_{-1};
 
   rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::JointState>::SharedPtr joint_pub_;
-  rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>::SharedPtr tcp_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>::SharedPtr flange_pub_;
   rclcpp_lifecycle::LifecyclePublisher<hikrobot_msgs::msg::RobotStatus>::SharedPtr status_pub_;
   rclcpp_lifecycle::LifecyclePublisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_pub_;
   rclcpp::TimerBase::SharedPtr state_timer_;

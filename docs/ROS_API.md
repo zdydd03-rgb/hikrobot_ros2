@@ -16,7 +16,12 @@ Action clients never provide `nPathID`; the driver owns and persists it.
 ## Topics
 
 - `/joint_states` (`sensor_msgs/JointState`), radians
-- `/hikrobot_driver/tcp_pose` (`geometry_msgs/PoseStamped`), base-frame metres/quaternion
+- `/hikrobot_driver/flange_pose` (`geometry_msgs/PoseStamped`): `^B T_F`, the flange pose
+  in `base_frame` (currently `base_link`). It is sourced from HAR `stBasePose`, with mm→m
+  translation and degree Roll/Pitch/Yaw→quaternion orientation conversion. It is not the
+  current Tool TCP pose. The driver publishes it only for valid, non-stale HAR state with at
+  least six joints. V0.2-01 timestamps it with the ROS publish time; mapping the original
+  HAR/controller sample time is future timestamp-discipline work.
 - `/hikrobot_driver/status` (`hikrobot_msgs/RobotStatus`)
 - `/diagnostics` (`diagnostic_msgs/DiagnosticArray`)
 

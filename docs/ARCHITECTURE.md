@@ -70,3 +70,6 @@ MPSDK boundary:
 - orientation: ZYX Euler degree
 
 HAR completion feedback uses `ST_HAR_ROBOT_STATUS::dJnt[]` and `stBasePose`.
+`stBasePose` is the base-to-flange transform `^B T_F`; it is published as
+`/hikrobot_driver/flange_pose`, not as a Tool TCP pose. V0.2-01 uses the ROS publish time
+for its timestamp; mapping HAR/controller sampling time is deferred to timestamp-discipline work.
