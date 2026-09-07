@@ -538,7 +538,11 @@ void HikrobotDriverNode::accept_move_j(const std::shared_ptr<GoalHandleMoveJ> go
     if (result_core.code == hikrobot_mpsdk_core::MotionResultCode::kSuccess) {
       goal_handle->succeed(result);
     } else if (result_core.code == hikrobot_mpsdk_core::MotionResultCode::kCanceled) {
-      goal_handle->canceled(result);
+      if (goal_handle->is_canceling()) {
+        goal_handle->canceled(result);
+      } else {
+        goal_handle->abort(result);
+      }
     } else {
       goal_handle->abort(result);
     }
@@ -587,9 +591,17 @@ void HikrobotDriverNode::accept_move_l(const std::shared_ptr<GoalHandleMoveL> go
     result->path_id = result_core.path_id;
     result->execution_time = duration_from_ms(result_core.execution_time);
     result->message = result_core.message;
-    if (result_core.code == hikrobot_mpsdk_core::MotionResultCode::kSuccess) goal_handle->succeed(result);
-    else if (result_core.code == hikrobot_mpsdk_core::MotionResultCode::kCanceled) goal_handle->canceled(result);
-    else goal_handle->abort(result);
+    if (result_core.code == hikrobot_mpsdk_core::MotionResultCode::kSuccess) {
+      goal_handle->succeed(result);
+    } else if (result_core.code == hikrobot_mpsdk_core::MotionResultCode::kCanceled) {
+      if (goal_handle->is_canceling()) {
+        goal_handle->canceled(result);
+      } else {
+        goal_handle->abort(result);
+      }
+    } else {
+      goal_handle->abort(result);
+    }
     release_goal_reservation();
   });
 }
@@ -637,9 +649,17 @@ void HikrobotDriverNode::accept_move_c(const std::shared_ptr<GoalHandleMoveC> go
     result->path_id = result_core.path_id;
     result->execution_time = duration_from_ms(result_core.execution_time);
     result->message = result_core.message;
-    if (result_core.code == hikrobot_mpsdk_core::MotionResultCode::kSuccess) goal_handle->succeed(result);
-    else if (result_core.code == hikrobot_mpsdk_core::MotionResultCode::kCanceled) goal_handle->canceled(result);
-    else goal_handle->abort(result);
+    if (result_core.code == hikrobot_mpsdk_core::MotionResultCode::kSuccess) {
+      goal_handle->succeed(result);
+    } else if (result_core.code == hikrobot_mpsdk_core::MotionResultCode::kCanceled) {
+      if (goal_handle->is_canceling()) {
+        goal_handle->canceled(result);
+      } else {
+        goal_handle->abort(result);
+      }
+    } else {
+      goal_handle->abort(result);
+    }
     release_goal_reservation();
   });
 }
@@ -698,9 +718,17 @@ void HikrobotDriverNode::accept_move_s(const std::shared_ptr<GoalHandleMoveS> go
     result->path_id = result_core.path_id;
     result->execution_time = duration_from_ms(result_core.execution_time);
     result->message = result_core.message;
-    if (result_core.code == hikrobot_mpsdk_core::MotionResultCode::kSuccess) goal_handle->succeed(result);
-    else if (result_core.code == hikrobot_mpsdk_core::MotionResultCode::kCanceled) goal_handle->canceled(result);
-    else goal_handle->abort(result);
+    if (result_core.code == hikrobot_mpsdk_core::MotionResultCode::kSuccess) {
+      goal_handle->succeed(result);
+    } else if (result_core.code == hikrobot_mpsdk_core::MotionResultCode::kCanceled) {
+      if (goal_handle->is_canceling()) {
+        goal_handle->canceled(result);
+      } else {
+        goal_handle->abort(result);
+      }
+    } else {
+      goal_handle->abort(result);
+    }
     release_goal_reservation();
   });
 }
