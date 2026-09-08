@@ -9,6 +9,10 @@ The current report, [`V0.1_to_V0.2-02_HIL_REPORT.md`](V0.1_to_V0.2-02_HIL_REPORT
 V0.1 gate and the V0.2-01, V0.2-02A, and V0.2-02B milestones through read-only ToolManager and
 TCP-pose publication.
 
+[`V0.2-03_BASE_CARTESIAN_AND_VISUAL_MOVEL_HIL_REPORT.md`](V0.2-03_BASE_CARTESIAN_AND_VISUAL_MOVEL_HIL_REPORT.md)
+covers the Base-frame Active-Tool TCP contract, guarded MoveL HIL, and the request-specific
+offline visual-point conversion and segmented MoveL observations.
+
 Each later HIL stage should record:
 
 - the exact commit under test;
