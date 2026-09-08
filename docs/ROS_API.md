@@ -1,17 +1,32 @@
-# ROS API (V0.1)
+# ROS API (V0.2)
 
 Node name: `/hikrobot_driver`
 
 ## Actions
 
 - `/hikrobot_driver/move_j` — six joint positions in radians + `speed_percent` (1..100)
-- `/hikrobot_driver/move_l` — Cartesian target `PoseStamped` + `speed_percent`
-- `/hikrobot_driver/move_c` — via pose + final target pose + `speed_percent`
-- `/hikrobot_driver/move_s` — up to 49 via poses + final target pose + `speed_percent`
+- `/hikrobot_driver/move_l` — target `^B T_TCP` `PoseStamped` + `speed_percent`
+- `/hikrobot_driver/move_c` — via and target `^B T_TCP` poses + `speed_percent`
+- `/hikrobot_driver/move_s` — up to 49 via `^B T_TCP` poses plus final `^B T_TCP` + `speed_percent`
 
 `blend_radius` maps directly to the public SDK's integer range 0..10. `timeout=0` uses the driver default.
 
 Action clients never provide `nPathID`; the driver owns and persists it.
+
+All MoveL/MoveC/MoveS poses must use the exact configured `base_frame` (currently
+`base_link`). Empty or different frames are rejected; the Driver does not perform TF
+conversion. Each pose means the controller Active Tool TCP in Base coordinates, never a
+flange, Tool 0, camera, or arbitrary-frame pose. The Driver refreshes the controller Active
+Tool before each Cartesian request, requires a flange-mounted Tool, and sends Base coordinate
+`1:0`, that Tool ID, and no workpiece (`-1`) to the legacy realtime SDK. The retained YAML
+`tool_id` does not select the Tool for Base Cartesian Actions.
+
+Cartesian feedback `target_pose` and `actual_pose` are both TCP poses. Actual TCP and completion
+errors are calculated from one per-motion Tool snapshot as `^B T_F × ^F T_Tool`; position error
+is reported in metres and orientation error in radians. Input ROS m/quaternion is converted to
+SDK mm/ZYX Euler degree. The default first-HIL guard rejects any current-to-first or adjacent
+path segment over `max_cartesian_translation_step_m=0.05` or
+`max_cartesian_rotation_step_rad=0.1745329252` (10 degrees), before PathID allocation or Add.
 
 ## Topics
 
@@ -29,7 +44,7 @@ Action clients never provide `nPathID`; the driver owns and persists it.
 SDK mm/degree ZYX Euler values become ROS m/normalized quaternion poses. The Driver exposes
 `/hikrobot_driver/get_active_tool` and `/hikrobot_driver/get_tool_info_list`; neither writes or
 switches Tools. After an external Tool switch, call `get_active_tool` or repeat lifecycle setup.
-No TF is published. Cartesian Action Tool-ID policy remains separate until Base Cartesian contract work.
+No TF is published, and camera/hand-eye transforms are not part of V0.2-03.
 - `/hikrobot_driver/status` (`hikrobot_msgs/RobotStatus`)
 - `/diagnostics` (`diagnostic_msgs/DiagnosticArray`)
 
@@ -39,6 +54,8 @@ No TF is published. Cartesian Action Tool-ID policy remains separate until Base 
 - `/hikrobot_driver/get_digital_output`
 - `/hikrobot_driver/get_digital_input`
 - `/hikrobot_driver/stop_motion`
+- `/hikrobot_driver/get_active_tool`
+- `/hikrobot_driver/get_tool_info_list`
 
 `stop_motion` is a normal software motion stop. It is **not** a safety-rated emergency stop.
 

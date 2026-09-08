@@ -1,4 +1,5 @@
 #include "hikrobot_driver/hikrobot_driver_node.hpp"
+#include "hikrobot_driver/cartesian_contract.hpp"
 
 #include <algorithm>
 #include <array>
@@ -9,10 +10,8 @@
 #include <sstream>
 #include <utility>
 
-#include "tf2/LinearMath/Matrix3x3.h"
 #include "tf2/LinearMath/Quaternion.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
-#include "tf2/time.h"
 
 namespace hikrobot_driver
 {
@@ -49,8 +48,6 @@ HikrobotDriverNode::HikrobotDriverNode(const rclcpp::NodeOptions & options)
 {
   declare_parameters();
   create_ros_interfaces();
-  tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
-  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 }
 
 HikrobotDriverNode::~HikrobotDriverNode()
@@ -86,6 +83,8 @@ void HikrobotDriverNode::declare_parameters()
   declare_parameter<int>("state_stale_timeout_ms", 1000);
   declare_parameter<int>("tool_id", 0);
   declare_parameter<int>("workpiece_id", -1);
+  declare_parameter<double>("max_cartesian_translation_step_m", 0.05);
+  declare_parameter<double>("max_cartesian_rotation_step_rad", 0.1745329252);
   declare_parameter<double>("state_publish_rate_hz", 20.0);
 }
 
@@ -244,6 +243,12 @@ HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_configure(const rclcpp
   state_stale_timeout_ms_ = get_parameter("state_stale_timeout_ms").as_int();
   tool_id_ = get_parameter("tool_id").as_int();
   workpiece_id_ = get_parameter("workpiece_id").as_int();
+  max_cartesian_translation_step_m_ = get_parameter("max_cartesian_translation_step_m").as_double();
+  max_cartesian_rotation_step_rad_ = get_parameter("max_cartesian_rotation_step_rad").as_double();
+  if (max_cartesian_translation_step_m_ <= 0.0 || max_cartesian_rotation_step_rad_ <= 0.0) {
+    RCLCPP_ERROR(get_logger(), "Cartesian step limits must be positive");
+    return CallbackReturn::FAILURE;
+  }
 
   std::string sequence_file = get_parameter("sequence_state_file").as_string();
   if (sequence_file.empty()) {
@@ -307,6 +312,12 @@ HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_activate(const rclcpp_
   cancel_requested_.store(false);
   ros_active_.store(true, std::memory_order_release);
   RCLCPP_INFO(get_logger(), "ACTIVE: AUTO + MotorOn + legacy realtime motion mode ready");
+  {
+    std::lock_guard<std::mutex> lock(active_tool_mutex_);
+    RCLCPP_INFO(
+      get_logger(), "Base Cartesian contract: frame=%s, coordinate=base(1:0), active_tool=%d",
+      base_frame_.c_str(), active_tool_cache_.id);
+  }
   return CallbackReturn::SUCCESS;
 }
 
@@ -487,39 +498,45 @@ bool HikrobotDriverNode::pose_to_sdk(
   const geometry_msgs::msg::PoseStamped & input,
   hikrobot_mpsdk_core::EulerPose & output, std::string & error) const
 {
-  geometry_msgs::msg::PoseStamped pose = input;
-  if (pose.header.frame_id.empty()) {
-    pose.header.frame_id = base_frame_;
-  }
+  return cartesian_pose_to_sdk(input, base_frame_, output, error);
+}
 
-  if (pose.header.frame_id != base_frame_) {
-    try {
-      pose = tf_buffer_->transform(pose, base_frame_, tf2::durationFromSec(0.2));
-    } catch (const tf2::TransformException & e) {
-      error = std::string("cannot transform pose to ") + base_frame_ + ": " + e.what();
-      return false;
-    }
-  }
-
-  tf2::Quaternion q;
-  tf2::fromMsg(pose.pose.orientation, q);
-  if (q.length2() < 1e-12) {
-    error = "target quaternion has zero length";
+bool HikrobotDriverNode::prepare_cartesian_goal(
+  const std::vector<geometry_msgs::msg::PoseStamped> & poses,
+  hikrobot_mpsdk_core::MotionOptions & options,
+  hikrobot_mpsdk_core::ToolInfo & tool, int64_t & sdk_error, std::string & error)
+{
+  sdk_error = 0;
+  if (!refresh_active_tool_cache(error, &sdk_error)) {
     return false;
   }
-  q.normalize();
-  double roll = 0.0;
-  double pitch = 0.0;
-  double yaw = 0.0;
-  tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
-
-  output.x_mm = pose.pose.position.x * 1000.0;
-  output.y_mm = pose.pose.position.y * 1000.0;
-  output.z_mm = pose.pose.position.z * 1000.0;
-  output.roll_deg = roll * kRadToDeg;
-  output.pitch_deg = pitch * kRadToDeg;
-  output.yaw_deg = yaw * kRadToDeg;
-  return true;
+  bool tool_valid = false;
+  {
+    std::lock_guard<std::mutex> lock(active_tool_mutex_);
+    tool_valid = active_tool_valid_;
+    tool = active_tool_cache_;
+  }
+  if (!apply_base_cartesian_options(tool_valid, tool, options, error)) {
+    return false;
+  }
+  const auto state = core_->robot_state();
+  const auto current = hikrobot_mpsdk_core::tcp_transform_if_valid(state, true, tool);
+  if (!current) {
+    error = "current TCP unavailable from valid non-stale HAR state";
+    return false;
+  }
+  std::vector<hikrobot_mpsdk_core::RigidTransform> path;
+  path.reserve(poses.size());
+  for (const auto & stamped : poses) {
+    tf2::Quaternion q;
+    tf2::fromMsg(stamped.pose.orientation, q);
+    q.normalize();
+    path.push_back({
+      stamped.pose.position.x, stamped.pose.position.y, stamped.pose.position.z,
+      {q.x(), q.y(), q.z(), q.w()}});
+  }
+  return hikrobot_mpsdk_core::cartesian_path_within_limits(
+    *current, path, max_cartesian_translation_step_m_, max_cartesian_rotation_step_rad_, error);
 }
 
 geometry_msgs::msg::PoseStamped HikrobotDriverNode::state_pose_to_ros(
@@ -575,9 +592,12 @@ hikrobot_msgs::msg::ToolInfo HikrobotDriverNode::tool_info_to_ros(
   return out;
 }
 
-bool HikrobotDriverNode::refresh_active_tool_cache(std::string & error)
+bool HikrobotDriverNode::refresh_active_tool_cache(std::string & error, int64_t * sdk_error)
 {
   const auto result = core_->get_active_tool();
+  if (sdk_error) {
+    *sdk_error = result.sdk_error;
+  }
   if (!result.success) {
     const auto low32 = static_cast<uint32_t>(static_cast<uint64_t>(result.sdk_error));
     std::ostringstream oss;
@@ -684,6 +704,18 @@ void HikrobotDriverNode::accept_move_l(const std::shared_ptr<GoalHandleMoveL> go
       return;
     }
     request.options = options_from_goal(goal->speed_percent, goal->blend_radius, goal->timeout);
+    int64_t sdk_error = 0;
+    if (!prepare_cartesian_goal(
+        {goal->target_pose}, request.options, request.tool, sdk_error, error))
+    {
+      auto result = std::make_shared<MoveL::Result>();
+      result->result_code = MoveL::Result::INVALID_GOAL;
+      result->sdk_error_code = sdk_error;
+      result->message = error;
+      goal_handle->abort(result);
+      release_goal_reservation();
+      return;
+    }
 
     hikrobot_mpsdk_core::RobotState target_state;
     target_state.base_pose = request.target;
@@ -695,7 +727,11 @@ void HikrobotDriverNode::accept_move_l(const std::shared_ptr<GoalHandleMoveL> go
         msg->progress_percent = fb.progress_percent;
         const auto stamp = now();
         msg->target_pose = state_pose_to_ros(target_state, stamp);
-        msg->actual_pose = state_pose_to_ros(fb.robot, stamp);
+        msg->actual_pose.header.stamp = stamp;
+        msg->actual_pose.header.frame_id = base_frame_;
+        if (fb.actual_tcp_valid) {
+          msg->actual_pose.pose = transform_to_ros(fb.actual_tcp);
+        }
         msg->position_error_m = fb.position_error_mm / 1000.0;
         msg->orientation_error_rad = fb.orientation_error_deg * kDegToRad;
         goal_handle->publish_feedback(msg);
@@ -742,6 +778,18 @@ void HikrobotDriverNode::accept_move_c(const std::shared_ptr<GoalHandleMoveC> go
       return;
     }
     request.options = options_from_goal(goal->speed_percent, goal->blend_radius, goal->timeout);
+    int64_t sdk_error = 0;
+    if (!prepare_cartesian_goal(
+        {goal->via_pose, goal->target_pose}, request.options, request.tool, sdk_error, error))
+    {
+      auto result = std::make_shared<MoveC::Result>();
+      result->result_code = MoveC::Result::INVALID_GOAL;
+      result->sdk_error_code = sdk_error;
+      result->message = error;
+      goal_handle->abort(result);
+      release_goal_reservation();
+      return;
+    }
     hikrobot_mpsdk_core::RobotState target_state;
     target_state.base_pose = request.target;
 
@@ -753,7 +801,11 @@ void HikrobotDriverNode::accept_move_c(const std::shared_ptr<GoalHandleMoveC> go
         msg->progress_percent = fb.progress_percent;
         const auto stamp = now();
         msg->target_pose = state_pose_to_ros(target_state, stamp);
-        msg->actual_pose = state_pose_to_ros(fb.robot, stamp);
+        msg->actual_pose.header.stamp = stamp;
+        msg->actual_pose.header.frame_id = base_frame_;
+        if (fb.actual_tcp_valid) {
+          msg->actual_pose.pose = transform_to_ros(fb.actual_tcp);
+        }
         msg->position_error_m = fb.position_error_mm / 1000.0;
         msg->orientation_error_rad = fb.orientation_error_deg * kDegToRad;
         goal_handle->publish_feedback(msg);
@@ -811,6 +863,18 @@ void HikrobotDriverNode::accept_move_s(const std::shared_ptr<GoalHandleMoveS> go
       return;
     }
     request.options = options_from_goal(goal->speed_percent, goal->blend_radius, goal->timeout);
+    std::vector<geometry_msgs::msg::PoseStamped> path = goal->via_poses;
+    path.push_back(goal->target_pose);
+    int64_t sdk_error = 0;
+    if (!prepare_cartesian_goal(path, request.options, request.tool, sdk_error, error)) {
+      auto result = std::make_shared<MoveS::Result>();
+      result->result_code = MoveS::Result::INVALID_GOAL;
+      result->sdk_error_code = sdk_error;
+      result->message = error;
+      goal_handle->abort(result);
+      release_goal_reservation();
+      return;
+    }
     hikrobot_mpsdk_core::RobotState target_state;
     target_state.base_pose = request.target;
 
@@ -822,7 +886,11 @@ void HikrobotDriverNode::accept_move_s(const std::shared_ptr<GoalHandleMoveS> go
         msg->progress_percent = fb.progress_percent;
         const auto stamp = now();
         msg->target_pose = state_pose_to_ros(target_state, stamp);
-        msg->actual_pose = state_pose_to_ros(fb.robot, stamp);
+        msg->actual_pose.header.stamp = stamp;
+        msg->actual_pose.header.frame_id = base_frame_;
+        if (fb.actual_tcp_valid) {
+          msg->actual_pose.pose = transform_to_ros(fb.actual_tcp);
+        }
         msg->position_error_m = fb.position_error_mm / 1000.0;
         msg->orientation_error_rad = fb.orientation_error_deg * kDegToRad;
         goal_handle->publish_feedback(msg);

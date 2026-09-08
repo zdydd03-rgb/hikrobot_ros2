@@ -19,10 +19,13 @@ hikrobot_driver:
     joint_tolerance_rad: 0.0034906585   # 0.2 deg
     position_tolerance_m: 0.001
     orientation_tolerance_rad: 0.0174532925  # 1 deg
+    max_cartesian_translation_step_m: 0.05  # 50 mm initial-HIL guard
+    max_cartesian_rotation_step_rad: 0.1745329252  # 10 deg initial-HIL guard
     stable_samples: 5
     state_stale_timeout_ms: 1000
 
-    # First-version V2.1.2 compatibility defaults.
+    # Retained compatibility defaults. tool_id does not select the Tool for Cartesian Actions;
+    # MoveL/MoveC/MoveS use the controller Active Tool with Base coordinate 1:0.
     tool_id: 0
     workpiece_id: -1
     state_publish_rate_hz: 20.0

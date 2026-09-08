@@ -10,8 +10,12 @@ the public MPSDK legacy motion API and Mv3dRgbdSDK respectively.
 - SDK package used during bring-up: `MPSDK_PUBLIC_LX64_V2.4.0_Build20251106_SVN1686294`
 - Link library: `libMPSDK_PUBLIC_COMPAT.so`
 - Motion API family: `MP_Motion_API.h` (legacy realtime motion API)
-- HIL verified: connection, HAR state subscription, control access, programmer login, AUTO, MotorOn/Off, realtime mode, MoveJ, common DO read/write
-- SDK/demo-backed and implemented in this repository, pending individual HIL regression: MoveL, MoveC, MoveS, DI read
+- HIL verified: connection, HAR state, activation, MoveJ, Cancel/StopMotion, PathID persistence,
+  collision recovery, flange/Tool/TCP semantics, Tool queries, and Base-frame Active-Tool TCP MoveL
+- Base Cartesian MoveC/MoveS are implemented and software-tested but still pending physical HIL;
+  IO/DO HIL is deferred
+- A request-specific visual Base-point segmented MoveL route has been checked through D7; dynamic
+  visual transforms, timestamp-synchronized flange history, and `FollowCartesianPath` are not implemented
 
 ## ROS packages
 
@@ -91,3 +95,4 @@ Every motion uses the controller-side legacy queue model:
 `nPathID` is allocated internally and persisted before the SDK Add call. Error `0x82068043` is treated as a recoverable first-command sequence collision only before motion starts; the core reserves a new ID and retries a bounded number of times.
 
 See `docs/ARCHITECTURE.md` for the detailed state machine and safety rules.
+Reviewed hardware results and limitations are indexed in `docs/hil/README.md`.

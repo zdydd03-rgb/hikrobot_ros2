@@ -1,4 +1,4 @@
-# Implementation status — V0.1
+# Implementation status — V0.2-03
 
 ## Implemented
 
@@ -20,6 +20,11 @@
 - lifecycle driver publishers/services/actions
 - automatic lifecycle bringup configuration and activation
 - HIL regression plan
+- lifecycle-aware `/flange_pose` (`^B T_F`) and `/tcp_pose` (`^B T_TCP`) publication
+- read-only controller Active Tool query, cache, and ROS services
+- strict Base-frame Active-Tool TCP contract for MoveL, MoveC, and MoveS
+- per-segment 50 mm / 10 degree Cartesian pre-Add guards
+- TCP-based Cartesian feedback and stable completion using a per-motion Tool snapshot
 
 ## Verification completed
 
@@ -35,11 +40,16 @@ The Ubuntu 22.04 + ROS 2 Humble development machine completed a full workspace b
 - all six packages were discoverable through the ROS 2 package index
 - `hikrobot_driver_node` started without a robot connection; its Lifecycle, topics,
   services, and MoveJ/MoveL/MoveC/MoveS action servers were visible in the ROS graph
+- physical HIL passed for Configure/HAR, Activate, MoveJ, Cancel, StopMotion, PathID persistence,
+  sequence-collision recovery, flange/TCP semantics, Tool queries, Base TCP MoveL, invalid-frame
+  rejection, the 50 mm guard, and a request-specific segmented visual MoveL route through D7
 
-## Not yet HIL-verified
+## Pending or deferred
 
-The ROS 2 Driver has not yet been validated against the physical controller. The next
-task is the manual Lifecycle `configure` HIL test, followed by activation and the
-ordered sequence in `docs/HIL_TEST_PLAN.md`. The earlier standalone SDK HIL baseline
-(connection, HAR, control access, PROGRAMMER, AUTO, MotorOn/Off, realtime Motion,
-MoveJ, and DO) remains the basis for that validation.
+- IO/DO HIL is deferred.
+- MoveC and MoveS have software tests but no physical HIL.
+- The complete automated visual three-point route and MoveL speed 3%/5% are not verified.
+- `FollowCartesianPath`, a dynamic visual-coordinate transform node, image-time/historical
+  flange-pose synchronization, and Driver hand-eye integration are not implemented.
+
+See `docs/hil/` for reviewed HIL evidence and exact limitations.

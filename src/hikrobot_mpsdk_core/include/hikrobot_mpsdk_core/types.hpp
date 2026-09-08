@@ -68,6 +68,11 @@ struct RigidTransform
 
 RigidTransform euler_pose_to_transform(const EulerPose & pose);
 RigidTransform compose_transforms(const RigidTransform & lhs, const RigidTransform & rhs);
+double transform_position_distance_m(const RigidTransform & a, const RigidTransform & b);
+double quaternion_angular_distance_rad(const Quaternion & a, const Quaternion & b);
+bool cartesian_path_within_limits(
+  const RigidTransform & current, const std::vector<RigidTransform> & path,
+  double max_translation_m, double max_rotation_rad, std::string & error);
 bool valid_tool_id(int32_t id);
 bool valid_tool_count(int32_t count);
 std::string bounded_sdk_string(const char * value, std::size_t capacity);
@@ -91,6 +96,16 @@ struct RobotState
 
 std::optional<RigidTransform> tcp_transform_if_valid(
   const RobotState & robot, bool active_tool_valid, const ToolInfo & active_tool);
+
+struct CartesianError
+{
+  RigidTransform actual_tcp{};
+  double position_error_m{0.0};
+  double orientation_error_rad{0.0};
+};
+
+std::optional<CartesianError> cartesian_tcp_error(
+  const RobotState & robot, const ToolInfo & tool, const EulerPose & target_tcp);
 
 struct MotionState
 {
@@ -129,6 +144,7 @@ struct MoveJRequest
 struct MoveLRequest
 {
   EulerPose target{};
+  ToolInfo tool{};
   MotionOptions options{};
 };
 
@@ -136,6 +152,7 @@ struct MoveCRequest
 {
   EulerPose via{};
   EulerPose target{};
+  ToolInfo tool{};
   MotionOptions options{};
 };
 
@@ -143,6 +160,7 @@ struct MoveSRequest
 {
   std::vector<EulerPose> via{};
   EulerPose target{};
+  ToolInfo tool{};
   MotionOptions options{};
 };
 
@@ -168,6 +186,8 @@ struct MotionFeedback
   double position_error_mm{0.0};
   double orientation_error_deg{0.0};
   std::array<double, 6> joint_error_deg{};
+  bool actual_tcp_valid{false};
+  RigidTransform actual_tcp{};
 };
 
 struct MotionResult

@@ -18,9 +18,6 @@
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "diagnostic_msgs/msg/diagnostic_array.hpp"
 
-#include "tf2_ros/buffer.h"
-#include "tf2_ros/transform_listener.h"
-
 #include "hikrobot_msgs/action/move_j.hpp"
 #include "hikrobot_msgs/action/move_l.hpp"
 #include "hikrobot_msgs/action/move_c.hpp"
@@ -90,12 +87,16 @@ private:
   bool pose_to_sdk(
     const geometry_msgs::msg::PoseStamped & input,
     hikrobot_mpsdk_core::EulerPose & output, std::string & error) const;
+  bool prepare_cartesian_goal(
+    const std::vector<geometry_msgs::msg::PoseStamped> & poses,
+    hikrobot_mpsdk_core::MotionOptions & options,
+    hikrobot_mpsdk_core::ToolInfo & tool, int64_t & sdk_error, std::string & error);
   geometry_msgs::msg::PoseStamped state_pose_to_ros(
     const hikrobot_mpsdk_core::RobotState & state, const rclcpp::Time & stamp) const;
   geometry_msgs::msg::Pose tool_pose_to_ros(const hikrobot_mpsdk_core::EulerPose & pose) const;
   geometry_msgs::msg::Pose transform_to_ros(const hikrobot_mpsdk_core::RigidTransform & transform) const;
   hikrobot_msgs::msg::ToolInfo tool_info_to_ros(const hikrobot_mpsdk_core::ToolInfo & tool) const;
-  bool refresh_active_tool_cache(std::string & error);
+  bool refresh_active_tool_cache(std::string & error, int64_t * sdk_error = nullptr);
   void clear_active_tool_cache();
 
   uint8_t map_result_code(hikrobot_mpsdk_core::MotionResultCode code) const;
@@ -122,6 +123,8 @@ private:
   int state_stale_timeout_ms_{1000};
   int tool_id_{0};
   int workpiece_id_{-1};
+  double max_cartesian_translation_step_m_{0.05};
+  double max_cartesian_rotation_step_rad_{0.1745329252};
 
   rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::JointState>::SharedPtr joint_pub_;
   rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>::SharedPtr flange_pub_;
@@ -142,8 +145,6 @@ private:
   rclcpp::Service<hikrobot_msgs::srv::GetActiveTool>::SharedPtr get_active_tool_service_;
   rclcpp::Service<hikrobot_msgs::srv::GetToolInfoList>::SharedPtr get_tool_info_list_service_;
 
-  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
-  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 };
 
 }  // namespace hikrobot_driver

@@ -39,50 +39,20 @@ std::string hex_error(int64_t code)
   return oss.str();
 }
 
-struct Quaternion
+bool cartesian_target_reached(
+  const RobotState & robot, const ToolInfo & tool, const EulerPose & target,
+  const MotionOptions & options, MotionFeedback & feedback)
 {
-  double w{1.0};
-  double x{0.0};
-  double y{0.0};
-  double z{0.0};
-};
-
-Quaternion euler_zyx_deg_to_quaternion(const EulerPose & pose)
-{
-  const double roll = pose.roll_deg * kPi / 180.0;
-  const double pitch = pose.pitch_deg * kPi / 180.0;
-  const double yaw = pose.yaw_deg * kPi / 180.0;
-
-  const double cr = std::cos(roll * 0.5);
-  const double sr = std::sin(roll * 0.5);
-  const double cp = std::cos(pitch * 0.5);
-  const double sp = std::sin(pitch * 0.5);
-  const double cy = std::cos(yaw * 0.5);
-  const double sy = std::sin(yaw * 0.5);
-
-  Quaternion q;
-  q.w = cy * cp * cr + sy * sp * sr;
-  q.x = cy * cp * sr - sy * sp * cr;
-  q.y = sy * cp * sr + cy * sp * cr;
-  q.z = sy * cp * cr - cy * sp * sr;
-  return q;
-}
-
-double orientation_error_deg(const EulerPose & a, const EulerPose & b)
-{
-  const Quaternion qa = euler_zyx_deg_to_quaternion(a);
-  const Quaternion qb = euler_zyx_deg_to_quaternion(b);
-  double dot = std::abs(qa.w * qb.w + qa.x * qb.x + qa.y * qb.y + qa.z * qb.z);
-  dot = std::clamp(dot, 0.0, 1.0);
-  return (2.0 * std::acos(dot)) * 180.0 / kPi;
-}
-
-double position_error_mm(const EulerPose & a, const EulerPose & b)
-{
-  const double dx = a.x_mm - b.x_mm;
-  const double dy = a.y_mm - b.y_mm;
-  const double dz = a.z_mm - b.z_mm;
-  return std::sqrt(dx * dx + dy * dy + dz * dz);
+  const auto actual = cartesian_tcp_error(robot, tool, target);
+  if (!actual) {
+    return false;
+  }
+  feedback.actual_tcp_valid = true;
+  feedback.actual_tcp = actual->actual_tcp;
+  feedback.position_error_mm = actual->position_error_m * 1000.0;
+  feedback.orientation_error_deg = actual->orientation_error_rad * 180.0 / kPi;
+  return feedback.position_error_mm <= options.position_tolerance_mm &&
+         feedback.orientation_error_deg <= options.orientation_tolerance_deg;
 }
 
 bool validate_options(const MotionOptions & options, std::string & error)
@@ -966,10 +936,7 @@ MotionResult RobotRuntime::execute_move_l(
       return impl_->call([this, &param]() {return MP_AddMovlTarget(impl_->handle, &param);});
     },
     [&request](const RobotState & robot, MotionFeedback & fb) {
-      fb.position_error_mm = position_error_mm(robot.base_pose, request.target);
-      fb.orientation_error_deg = orientation_error_deg(robot.base_pose, request.target);
-      return fb.position_error_mm <= request.options.position_tolerance_mm &&
-             fb.orientation_error_deg <= request.options.orientation_tolerance_deg;
+      return cartesian_target_reached(robot, request.tool, request.target, request.options, fb);
     },
     feedback, cancel_requested);
 }
@@ -989,10 +956,7 @@ MotionResult RobotRuntime::execute_move_c(
       return impl_->call([this, &param]() {return MP_AddMovcTarget(impl_->handle, &param);});
     },
     [&request](const RobotState & robot, MotionFeedback & fb) {
-      fb.position_error_mm = position_error_mm(robot.base_pose, request.target);
-      fb.orientation_error_deg = orientation_error_deg(robot.base_pose, request.target);
-      return fb.position_error_mm <= request.options.position_tolerance_mm &&
-             fb.orientation_error_deg <= request.options.orientation_tolerance_deg;
+      return cartesian_target_reached(robot, request.tool, request.target, request.options, fb);
     },
     feedback, cancel_requested);
 }
@@ -1023,10 +987,7 @@ MotionResult RobotRuntime::execute_move_s(
       return impl_->call([this, &param]() {return MP_AddMovsTarget(impl_->handle, &param);});
     },
     [&request](const RobotState & robot, MotionFeedback & fb) {
-      fb.position_error_mm = position_error_mm(robot.base_pose, request.target);
-      fb.orientation_error_deg = orientation_error_deg(robot.base_pose, request.target);
-      return fb.position_error_mm <= request.options.position_tolerance_mm &&
-             fb.orientation_error_deg <= request.options.orientation_tolerance_deg;
+      return cartesian_target_reached(robot, request.tool, request.target, request.options, fb);
     },
     feedback, cancel_requested);
 }
