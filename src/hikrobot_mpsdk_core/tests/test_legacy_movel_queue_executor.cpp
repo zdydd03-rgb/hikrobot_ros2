@@ -150,6 +150,26 @@ public:
       state.received_at = now_value;
       return state;
     }
+    if (window_refill_mode && started && !added.empty() && sample_index > 0) {
+      state.valid = true;
+      state.sequence = window_reuse_callback_sequence ? 1 :
+        (window_callback_sequences.size() >= sample_index ?
+        window_callback_sequences[sample_index - 1] : sample_index);
+      state.received_at = now_value;
+      if (sample_index <= window_refill_terminal_after) {
+        const std::size_t index = std::min(sample_index - 1, added.size() - 1);
+        state.path_id = added[index].path_id;
+        state.next_target_id = added[index].target_id;
+        state.stopped = false;
+        state.left_path_count = window_left_path_count;
+        return state;
+      }
+      state.path_id = added.back().path_id;
+      state.previous_target_id = added.back().target_id;
+      state.stopped = true;
+      state.left_path_count = 0;
+      return state;
+    }
     if (!started || added.empty() || sample_index == 0) {
       return state;
     }
@@ -229,9 +249,14 @@ public:
   bool reuse_running_sequence_for_terminal{false};
   bool wrong_terminal_target_id{false};
   bool stop_callback_during_call{false};
+  bool window_refill_mode{false};
+  bool window_reuse_callback_sequence{false};
+  std::vector<uint64_t> window_callback_sequences;
   int execution_motion_status{0};
+  int32_t window_left_path_count{9};
   std::size_t sample_index{0};
   std::size_t queue_begin{0};
+  std::size_t window_refill_terminal_after{0};
   std::chrono::steady_clock::time_point now_value{std::chrono::milliseconds(1000)};
   std::chrono::steady_clock::time_point start_time{};
   std::chrono::steady_clock::time_point stop_request_time{};
@@ -367,6 +392,163 @@ TEST_F(QueueExecutorTest, PersistsUniqueCompleteIdBlockBeforeAddsAndStartsOnce)
   EXPECT_EQ(std::count(backend.events.begin(), backend.events.end(), "clear"), 1);
   EXPECT_EQ(std::count(backend.events.begin(), backend.events.end(), "start"), 1);
   EXPECT_EQ(backend.events, (std::vector<std::string>{"clear", "add", "add", "start"}));
+}
+
+TEST_F(QueueExecutorTest, OneTargetUsesOneInitialAddAndNoRefill)
+{
+  const auto result = run(request(1));
+  EXPECT_EQ(result.code, hc::MotionResultCode::kSuccess);
+  EXPECT_EQ(backend.added.size(), 1U);
+  EXPECT_EQ(std::count(backend.events.begin(), backend.events.end(), "start"), 1);
+}
+
+TEST_F(QueueExecutorTest, TenTargetsFillInitialWindowAndStartOnce)
+{
+  const auto result = run(request(10));
+  EXPECT_EQ(result.code, hc::MotionResultCode::kSuccess);
+  EXPECT_EQ(backend.added.size(), 10U);
+  EXPECT_EQ(std::count(backend.events.begin(), backend.events.end(), "start"), 1);
+}
+
+TEST_F(QueueExecutorTest, TwentyTargetsRefillOneControllerWindowWithOneStart)
+{
+  backend.window_refill_mode = true;
+  backend.window_refill_terminal_after = 10;
+  auto value = request(20);
+  value.options.timeout = std::chrono::milliseconds(1500);
+  std::vector<hc::CartesianPathFeedback> feedback_values;
+  const auto result = run_with_feedback(value, feedback_values);
+  ASSERT_EQ(result.code, hc::MotionResultCode::kSuccess);
+  ASSERT_EQ(backend.added.size(), 20U);
+  EXPECT_EQ(std::count(backend.events.begin(), backend.events.end(), "start"), 1);
+  const auto start = std::find(backend.events.begin(), backend.events.end(), "start");
+  EXPECT_EQ(std::count(backend.events.begin(), start, "add"), 10);
+  EXPECT_EQ(
+    backend.persisted_values_seen_by_add,
+    std::vector<int32_t>(20, 140));
+  std::vector<int32_t> ids;
+  for (const auto & target : backend.added) {
+    ids.push_back(target.path_id);
+  }
+  std::sort(ids.begin(), ids.end());
+  EXPECT_EQ(std::adjacent_find(ids.begin(), ids.end()), ids.end());
+  EXPECT_TRUE(std::any_of(
+    feedback_values.begin(), feedback_values.end(),
+    [](const auto & item) {return item.queued_targets == 10; }));
+  EXPECT_EQ(feedback_values.back().queued_targets, 20U);
+}
+
+TEST_F(QueueExecutorTest, ThirtyTwoTargetsStayWithinWindowAndStartOnce)
+{
+  backend.window_refill_mode = true;
+  backend.window_refill_terminal_after = 22;
+  auto value = request(32);
+  value.options.timeout = std::chrono::milliseconds(2500);
+  const auto result = run(value);
+  ASSERT_EQ(result.code, hc::MotionResultCode::kSuccess);
+  EXPECT_EQ(backend.added.size(), 32U);
+  EXPECT_EQ(std::count(backend.events.begin(), backend.events.end(), "start"), 1);
+  const auto start = std::find(backend.events.begin(), backend.events.end(), "start");
+  EXPECT_EQ(std::count(backend.events.begin(), start, "add"), 10);
+  EXPECT_EQ(
+    backend.persisted_values_seen_by_add,
+    std::vector<int32_t>(32, 164));
+}
+
+TEST_F(QueueExecutorTest, RepeatedMotionCallbackSequenceCannotRepeatRefill)
+{
+  backend.window_refill_mode = true;
+  backend.window_reuse_callback_sequence = true;
+  backend.window_refill_terminal_after = 100;
+  auto value = request(20);
+  value.options.timeout = std::chrono::milliseconds(300);
+  value.options.stop_confirmation_timeout = std::chrono::milliseconds(100);
+  const auto result = run(value);
+  EXPECT_EQ(result.code, hc::MotionResultCode::kTimeout);
+  EXPECT_EQ(backend.added.size(), 11U);
+  EXPECT_EQ(std::count(backend.events.begin(), backend.events.end(), "start"), 1);
+}
+
+TEST_F(QueueExecutorTest, OutOfOrderMotionCallbackCannotRepeatRefill)
+{
+  backend.window_refill_mode = true;
+  backend.window_refill_terminal_after = 100;
+  backend.window_callback_sequences = {1, 2, 1};
+  auto value = request(20);
+  value.options.timeout = std::chrono::milliseconds(200);
+  value.options.stop_confirmation_timeout = std::chrono::milliseconds(100);
+  const auto result = run(value);
+  EXPECT_EQ(result.code, hc::MotionResultCode::kTimeout);
+  EXPECT_EQ(backend.added.size(), 12U);
+  EXPECT_EQ(std::count(backend.events.begin(), backend.events.end(), "start"), 1);
+}
+
+TEST_F(QueueExecutorTest, RefillAddFailureStopsWithoutRetryingOrSecondStart)
+{
+  backend.window_refill_mode = true;
+  backend.window_refill_terminal_after = 100;
+  backend.add_results.assign(10, 0);
+  backend.add_results.push_back(0x1234);
+  auto value = request(20);
+  value.options.timeout = std::chrono::milliseconds(1000);
+  const auto result = run(value);
+  EXPECT_EQ(result.code, hc::MotionResultCode::kSdkError);
+  EXPECT_EQ(result.sdk_error, 0x1234);
+  EXPECT_EQ(result.failure_stage, hc::PathFailureStage::kAdd);
+  EXPECT_TRUE(result.failure_target_index_valid);
+  EXPECT_EQ(result.failure_target_index, 10U);
+  EXPECT_EQ(backend.added.size(), 11U);
+  EXPECT_EQ(std::count(backend.events.begin(), backend.events.end(), "start"), 1);
+}
+
+TEST_F(QueueExecutorTest, RefillCollisionDoesNotAllocateNewIdsOrRetryPath)
+{
+  backend.window_refill_mode = true;
+  backend.window_refill_terminal_after = 100;
+  backend.add_results.assign(10, 0);
+  backend.add_results.push_back(kCollision);
+  auto value = request(20);
+  value.options.timeout = std::chrono::milliseconds(1000);
+  const auto result = run(value);
+  EXPECT_EQ(result.code, hc::MotionResultCode::kSdkError);
+  EXPECT_EQ(result.sdk_error, kCollision);
+  EXPECT_EQ(result.path_ids.size(), 20U);
+  EXPECT_EQ(backend.added.size(), 11U);
+  EXPECT_EQ(std::count(backend.events.begin(), backend.events.end(), "start"), 1);
+  std::ifstream input(state_file);
+  int32_t high_water = 0;
+  input >> high_water;
+  EXPECT_EQ(high_water, 140);
+}
+
+TEST_F(QueueExecutorTest, CancelDuringRefillStopsWithoutSubmittingLaterTargets)
+{
+  backend.window_refill_mode = true;
+  backend.window_refill_terminal_after = 100;
+  backend.cancel_flag = &cancel;
+  backend.cancel_after_add_call = 10;
+  auto value = request(20);
+  value.options.timeout = std::chrono::milliseconds(1000);
+  const auto result = run(value);
+  EXPECT_EQ(result.code, hc::MotionResultCode::kCanceled);
+  EXPECT_EQ(backend.added.size(), 11U);
+  EXPECT_EQ(std::count(backend.events.begin(), backend.events.end(), "stop"), 1);
+}
+
+TEST_F(QueueExecutorTest, PrematureStoppedCallbackReportsQueueUnderflowImmediately)
+{
+  backend.window_refill_mode = true;
+  backend.window_refill_terminal_after = 0;
+  auto value = request(20);
+  value.options.timeout = std::chrono::milliseconds(1000);
+  const auto result = run(value);
+  EXPECT_EQ(result.code, hc::MotionResultCode::kSdkError);
+  EXPECT_EQ(result.failure_stage, hc::PathFailureStage::kExecution);
+  EXPECT_FALSE(recovery.load());
+  EXPECT_LT(result.execution_time, value.options.timeout);
+  EXPECT_NE(result.message.find("queue underflow/premature stop"), std::string::npos);
+  EXPECT_NE(result.message.find("submitted_targets=10/20"), std::string::npos);
+  EXPECT_EQ(std::count(backend.events.begin(), backend.events.end(), "start"), 1);
 }
 
 TEST_F(QueueExecutorTest, ExhaustionAndPersistenceFailureOccurBeforeAnySdkCall)
@@ -509,8 +691,10 @@ TEST_F(QueueExecutorTest, WrongPathCallbackCannotProveCompletion)
   auto value = request();
   value.options.timeout = std::chrono::milliseconds(200);
   const auto result = run(value);
-  EXPECT_EQ(result.code, hc::MotionResultCode::kTimeout);
+  EXPECT_EQ(result.code, hc::MotionResultCode::kSdkError);
+  EXPECT_EQ(result.failure_stage, hc::PathFailureStage::kStop);
   EXPECT_TRUE(recovery.load());
+  EXPECT_NE(result.message.find("queue underflow/premature stop"), std::string::npos);
 }
 
 TEST_F(QueueExecutorTest, RepeatedHarSampleCannotSupplyStableSamples)

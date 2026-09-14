@@ -61,6 +61,10 @@ offline-test work only; no real arc HIL has been rerun.
 - MoveC and MoveS have software tests but no physical HIL.
 - The complete automated visual three-point route and MoveL speed 3%/5% are not verified.
 - FollowCartesianPath has software implementation and offline tests, but no controller HIL yet.
+- Controller 2.1.2 HIL observed that a 20-target Legacy request consumed only its first 10 active
+  queue entries. The core now uses a first-window-10, one-Start, execution-worker refill strategy
+  based on new Motion callback `nLeftPathNum`; every 1..32 target PathID remains preallocated and
+  each target is added once. Continuous 20/32-target HIL remains pending.
 - The stop-deadline repair and completion diagnostics have offline coverage only; the physical
   single-point arrival did not produce retained raw Legacy callback evidence, so strict final
   callback compatibility remains pending controller 2.1.2 HIL.

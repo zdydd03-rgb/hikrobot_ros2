@@ -16,6 +16,9 @@ constexpr int64_t kSdkSuccess = 0;
 constexpr int64_t kErrFirstCmdRepeat = static_cast<int64_t>(0x82068043ULL);
 constexpr int kServoEnabled = 1;
 constexpr int kMotionAlreadyStopped = 0;
+// MP_Motion_API.h does not state this bound. Ten is the controller 2.1.2
+// behavior observed in Legacy HIL, corroborated by the API2 queue limit.
+constexpr std::size_t kController212QueueWindow = 10;
 
 std::string hex_error(int64_t code)
 {
@@ -194,7 +197,8 @@ std::string diagnostic_summary(const CartesianPathFeedback & fb)
   } else {
     out << "none";
   }
-  out << ", running_evidence=" << fb.observed_running_queue_evidence
+  out << ", queued_targets=" << fb.queued_targets << '/' << fb.total_targets
+      << ", running_evidence=" << fb.observed_running_queue_evidence
       << ", terminal_evidence=" << fb.observed_terminal_queue_evidence
       << ", final_in_tolerance=" << fb.final_in_tolerance
       << ", har_motion_status=" << fb.har_motion_status
@@ -324,6 +328,8 @@ CartesianPathResult LegacyMoveLQueueExecutor::execute(
   std::vector<int32_t> active_path_ids;
   std::vector<int32_t> active_target_ids;
   bool queued = false;
+  std::size_t submitted_targets = 0;
+  std::size_t next_target_to_submit = 0;
 
   const auto clear_after_failure = [this, &result](const std::string & context) {
       const int64_t clear_ret = backend_.clear_motion_targets();
@@ -391,7 +397,9 @@ CartesianPathResult LegacyMoveLQueueExecutor::execute(
     }
 
     bool retry_collision = false;
-    for (std::size_t i = 0; i < request.targets.size(); ++i) {
+    const std::size_t initial_targets = std::min(
+      request.targets.size(), kController212QueueWindow);
+    for (std::size_t i = 0; i < initial_targets; ++i) {
       if (canceled(cancel_requested) || backend_.stop_generation() != accepted_stop_generation) {
         result.code = MotionResultCode::kCanceled;
         result.failure_stage = PathFailureStage::kAdd;
@@ -456,6 +464,8 @@ CartesianPathResult LegacyMoveLQueueExecutor::execute(
     // Failed collision attempts remain consumed in the persisted allocator high-water mark,
     // but the Action result describes only the complete queue from the final attempt.
     result.path_ids = active_path_ids;
+    submitted_targets = initial_targets;
+    next_target_to_submit = initial_targets;
     queued = true;
     break;
   }
@@ -470,7 +480,7 @@ CartesianPathResult LegacyMoveLQueueExecutor::execute(
   }
 
   fb.stage = PathExecutionStage::kReadyToStart;
-  fb.queued_targets = request.targets.size();
+  fb.queued_targets = submitted_targets;
   fb.current_segment_valid = false;
   publish(fb);
 
@@ -519,6 +529,7 @@ CartesianPathResult LegacyMoveLQueueExecutor::execute(
   bool observed_terminal_queue_evidence = false;
   int stable_samples = 0;
   const uint64_t motion_sequence_at_start = backend_.motion_state().sequence;
+  uint64_t last_processed_motion_callback_sequence = motion_sequence_at_start;
   const uint64_t robot_sequence_at_start =
     backend_.robot_state(request.options.state_stale_timeout).sequence;
   uint64_t last_counted_robot_sequence = robot_sequence_at_start;
@@ -638,6 +649,98 @@ CartesianPathResult LegacyMoveLQueueExecutor::execute(
       fb.current_segment_valid = false;
     }
 
+    // Only the execution worker refills. A callback merely updates the runtime
+    // cache, and each increasing callback sequence gets one refill decision.
+    const bool new_motion_callback = motion.valid &&
+      motion.sequence > last_processed_motion_callback_sequence;
+    if (new_motion_callback) {
+      last_processed_motion_callback_sequence = motion.sequence;
+      const bool final_path_observed = segment && *segment + 1 == active_path_ids.size();
+      if (motion.stopped && motion.sequence > motion_sequence_at_start &&
+        (submitted_targets < request.targets.size() || motion.left_path_count > 0 ||
+        !final_path_observed))
+      {
+        const std::string segment_label = fb.current_segment_valid ?
+          std::to_string(fb.current_segment_index) : "none";
+        fb.queued_targets = submitted_targets;
+        fb.completion_blocker = "queue_underflow_or_premature_stop";
+        fb.diagnostic_summary = diagnostic_summary(fb);
+        stop_and_classify(
+          MotionResultCode::kSdkError, PathFailureStage::kExecution,
+          "queue underflow/premature stop after motion callback sequence " +
+          std::to_string(motion.sequence) + " (path_id=" +
+          std::to_string(motion.path_id) + ", segment=" +
+          segment_label +
+          ", left_paths=" + std::to_string(motion.left_path_count) +
+          ", submitted_targets=" + std::to_string(submitted_targets) + "/" +
+          std::to_string(request.targets.size()) + ", next_target_to_submit=" +
+          std::to_string(next_target_to_submit) + ", last_submitted_path_id=" +
+          std::to_string(active_path_ids[submitted_targets - 1]) +
+          ", running_evidence=" +
+          std::string(observed_running_queue_evidence ? "true" : "false") +
+          ", har_motion_status=" + std::to_string(robot.motion_status) + ")");
+        finish();
+        return result;
+      }
+
+      if (!motion.stopped && next_target_to_submit < request.targets.size()) {
+        const std::size_t remaining_in_controller = static_cast<std::size_t>(std::max(
+          0, motion.left_path_count));
+        const std::size_t available_slots = kController212QueueWindow - std::min(
+          kController212QueueWindow, remaining_in_controller);
+        const std::size_t refill_count = std::min(
+          available_slots, request.targets.size() - next_target_to_submit);
+        for (std::size_t refill = 0; refill < refill_count; ++refill) {
+          const std::size_t target_index = next_target_to_submit;
+          if (canceled(cancel_requested) ||
+            backend_.stop_generation() != accepted_stop_generation)
+          {
+            stop_and_classify(
+              MotionResultCode::kCanceled, PathFailureStage::kExecution,
+              "path cancellation requested during queue refill before target " +
+              std::to_string(target_index));
+            finish();
+            return result;
+          }
+          if (backend_.now() >= deadline) {
+            stop_and_classify(
+              MotionResultCode::kTimeout, PathFailureStage::kExecution,
+              "path timed out during queue refill before target " +
+              std::to_string(target_index));
+            finish();
+            return result;
+          }
+          const int64_t add_ret = backend_.add_move_l(
+            active_path_ids[target_index], active_target_ids[target_index],
+            request.targets[target_index], request.options);
+          if (add_ret != kSdkSuccess) {
+            result.failure_target_index_valid = true;
+            result.failure_target_index = target_index;
+            fb.queued_targets = submitted_targets;
+            fb.completion_blocker = "queue_refill_add_failed";
+            fb.diagnostic_summary = diagnostic_summary(fb);
+            stop_and_classify(
+              MotionResultCode::kSdkError, PathFailureStage::kAdd,
+              "MP_AddMovlTarget refill failed at target " +
+              std::to_string(target_index) + ": " + hex_error(add_ret) +
+              "; Start was already successful, so the path was not retried");
+            // Preserve the refill failure when Stop was confirmed. A failed Stop
+            // remains the primary SDK error for recovery handling.
+            if (result.failure_stage != PathFailureStage::kStop) {
+              result.sdk_error = add_ret;
+            }
+            finish();
+            return result;
+          }
+          ++submitted_targets;
+          ++next_target_to_submit;
+          fb.queued_targets = submitted_targets;
+          fb.stage = PathExecutionStage::kExecuting;
+          publish(fb);
+        }
+      }
+    }
+
     const auto error = cartesian_tcp_error(robot, request.tool, request.targets.back());
     if (error) {
       fb.actual_tcp_valid = true;
@@ -688,7 +791,8 @@ CartesianPathResult LegacyMoveLQueueExecutor::execute(
       publish(fb);
       last_diagnostic_key = diagnostic_key;
     }
-    if (stable_samples >= request.options.stable_samples) {
+    if (submitted_targets == request.targets.size() &&
+      stable_samples >= request.options.stable_samples) {
       result.code = MotionResultCode::kSuccess;
       result.sdk_error = kSdkSuccess;
       result.failure_stage = PathFailureStage::kNone;

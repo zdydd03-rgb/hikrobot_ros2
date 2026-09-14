@@ -6,6 +6,26 @@ Purpose: establish the repository truth needed for later IO HIL and automatic co
 trajectory work. This document records the current implementation and reviewed historical evidence;
 it does not authorize or report a new controller connection or robot operation.
 
+## 2026-09-14 FollowCartesianPath Legacy queue-window repair
+
+**[User HIL report plus source repair]** On controller 2.1.2, a 20-target request preallocated and
+persisted all IDs, completed twenty successful Legacy Adds, and called Start once, but physically
+ran segments 0 through 9 only. Its stopped callback reported `left_paths=10`, segment 9, and the
+final TCP error remained 125.582 mm; the previous Driver waited until its 300 s timeout. This is
+evidence that pre-Start Adds do not make more than ten targets continuously consumable by the
+controller. `MP_Motion_API.h` does not state this capacity. API2 documents a ten-entry controller
+queue and is corroborating evidence only; the Driver remains on Legacy APIs.
+
+The executor now reserves/persists the complete PathID block before the first Add, submits an
+initial ten-target window, calls `MP_StartRealTimeMotion` once, and refills only from the worker
+when a newer cached Motion callback reports vacant paths via `nLeftPathNum`. It never invokes SDK
+from the callback, starts again, clears/replays normal execution, changes PathIDs, or splits the
+Action. Each target is added once. A fresh stopped callback with unsubmitted targets,
+`left_paths>0`, or no final PathID is immediately classified as queue underflow/premature stop and
+enters normal stop confirmation. Software tests cover this behavior; 20/32-target continuity still
+requires HIL. No controller/Driver connection, lifecycle transition, motion, IO, or PathID state
+file operation was performed for this source-only repair.
+
 ## 2026-09-11 FollowCartesianPath timeout repair
 
 **[Source inspection and software test]** The single-point HIL reached the commanded TCP tolerance

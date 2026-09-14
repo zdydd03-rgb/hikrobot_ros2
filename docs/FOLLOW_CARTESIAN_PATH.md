@@ -18,9 +18,18 @@ Using RobotRuntime's single handle and SDK mutex, the executor validates state a
 Active Tool snapshot, reserves and persists two PathIDs per target, then calls:
 
 1. `MP_ClearMotionTarget`;
-2. `MP_AddMovlTarget` once for each target (`nCsType=1`, `nCsID=0`, `nToolId=active`,
-   `nWorkPieceId=-1`);
-3. `MP_StartRealTimeMotion` once.
+2. `MP_AddMovlTarget` for the initial controller window only (at most 10 targets,
+   each with `nCsType=1`, `nCsID=0`, `nToolId=active`, `nWorkPieceId=-1`);
+3. `MP_StartRealTimeMotion` once;
+4. from the execution worker, use each new cached Legacy Motion callback's
+   `nLeftPathNum` to refill vacant window slots with remaining targets.
+
+Controller 2.1.2 HIL observed a ten-target active Legacy queue window: a 20-target request
+accepted all pre-Start Adds but ran only targets 0 through 9. The Legacy header does not document
+that maximum; API2's documented ten-entry controller queue is corroborating evidence only, not
+this Driver's calling interface. The Action still accepts 1..32 targets, calls Start once, and
+never clears, restarts, or splits normal execution. Every target retains its preallocated PathID
+and is added once.
 
 The exact pre-Start `0x82068043` collision may retry the complete queue with a new ID block.
 After Start is attempted there is no automatic retry. Partial Add failures clear the queue;
@@ -63,21 +72,31 @@ On bounded PathID collision retry, failed blocks remain consumed in the persiste
 never reused. The Action result `path_ids` contains only the complete final queue attempt, not IDs
 from failed collision attempts.
 
+Success additionally requires every target to have been submitted. After Start, a fresh stopped
+callback with unsubmitted targets, positive `nLeftPathNum`, or no final PathID observation is a
+queue-underflow/premature-stop failure, never success. It enters the independent stop-confirmation
+path and reports callback sequence, path/segment, left paths, submitted/total, next target, last
+submitted PathID, running evidence, and HAR motion status. Refill Add failures (including
+`0x82068043`) do not reserve IDs, retry the path, or start again.
+
 ## Offline verification
 
 `test_legacy_movel_queue_executor` injects a fake Legacy backend, fake clock, and temporary PathID
 state file. It covers validation and bounds, persistence-before-Add, unique IDs, one Start for N
 Adds, collision retry, partial cleanup and recovery lock, cancellation/Stop races, stale HAR,
 independent stop confirmation timing, old/wrong/matching stop callbacks, callback/HAR sequences,
-completion blockers, conservative completion and final success. No real SDK connection or user
+completion blockers, conservative completion and final success. It additionally scripts 1, 10, 20
+and 32 target queue windows, repeated/out-of-order callbacks, refill failures/collision,
+refill cancellation, and premature stopped callbacks. No real SDK connection or user
 PathID state is accessed. The companion Cartesian tests cover frame/value conversion and step
 guards.
 
 ## HIL still required
 
 This repair has source and offline-test evidence only; it has not been rerun on the controller.
-Controller 2.1.2 behavior for multi-point Legacy queue continuity, raw intermediate/final callback
-semantics, blend-radius behavior, timeout/stop confirmation, and queue capacity remains unverified.
+The controller 2.1.2 ten-target queue-window observation now has a software refill repair, but
+20/32-target continuity, raw intermediate/final callback semantics, blend-radius behavior and
+timeout/stop confirmation still require HIL.
 The next HIL must retain the raw diagnostic snapshots rather than infer callback state from physical
 arrival. MoveC/MoveS HIL, online visual correction, hand-eye integration and welding IO are outside
 this change.

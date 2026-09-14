@@ -86,9 +86,15 @@ The driver therefore:
 validates every pose, the timeout and the configured 50 mm/10 degree per-segment guard before
 allocating IDs. The core then reserves and persists two IDs per point, clears the legacy queue,
 adds each `ST_MOTION_MOV_PARAM` with Base coordinate `1:0`, `nToolId` from one Active Tool
-snapshot and `nWorkPieceId=-1`, and calls `MP_StartRealTimeMotion` exactly once. It does not
-chain ROS MoveL actions or use Motion API2. A collision retry is permitted only before Start and
-requeues the complete path with a fresh persisted block.
+ snapshot and `nWorkPieceId=-1`. Controller 2.1.2 HIL observed a ten-entry active Legacy window:
+the core adds the first ten targets, calls `MP_StartRealTimeMotion` exactly once, then refills
+vacancies from new cached Motion callback sequences using `nLeftPathNum`. The Legacy header does
+not state the limit; API2's documented ten-entry queue is corroboration only and is not used as a
+calling interface. The Action is not split, every target is added once with its original
+preallocated PathID, and normal execution issues no second Start or Clear. A collision retry is
+permitted only before Start and requeues the complete path with a fresh persisted block. A stopped
+callback with `left_paths>0`, unsubmitted targets, or no final PathID is queue underflow/premature
+stop, not success.
 
 Feedback and completion use the same Tool snapshot to compose HAR `^B T_F` into
 `^B T_TCP = ^B T_F × ^F T_Tool`. Completion requires post-Start matching motion-callback queue
