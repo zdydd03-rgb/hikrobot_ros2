@@ -79,6 +79,7 @@ std::string bounded_sdk_string(const char * value, std::size_t capacity);
 
 struct RobotState
 {
+  uint64_t sequence{0};
   bool valid{false};
   bool stale{true};
   int servo_status{0};
@@ -109,6 +110,7 @@ std::optional<CartesianError> cartesian_tcp_error(
 
 struct MotionState
 {
+  uint64_t sequence{0};
   bool valid{false};
   int32_t path_id{0};
   int32_t previous_target_id{0};
@@ -133,6 +135,7 @@ struct MotionOptions
   double orientation_tolerance_deg{1.0};
   int stable_samples{5};
   std::chrono::milliseconds state_stale_timeout{1000};
+  std::chrono::milliseconds stop_confirmation_timeout{3000};
 };
 
 struct MoveJRequest
@@ -160,6 +163,13 @@ struct MoveSRequest
 {
   std::vector<EulerPose> via{};
   EulerPose target{};
+  ToolInfo tool{};
+  MotionOptions options{};
+};
+
+struct FollowCartesianPathRequest
+{
+  std::vector<EulerPose> targets{};
   ToolInfo tool{};
   MotionOptions options{};
 };
@@ -199,6 +209,75 @@ struct MotionResult
   std::string message{};
 };
 
+enum class PathExecutionStage : uint8_t
+{
+  kValidating = 0,
+  kReservingIds = 1,
+  kClearingQueue = 2,
+  kQueueing = 3,
+  kReadyToStart = 4,
+  kExecuting = 5,
+  kStopping = 6,
+};
+
+enum class PathFailureStage : uint8_t
+{
+  kNone = 0,
+  kValidation = 1,
+  kIdReservation = 2,
+  kClear = 3,
+  kAdd = 4,
+  kStart = 5,
+  kExecution = 6,
+  kStop = 7,
+};
+
+struct CartesianPathFeedback
+{
+  PathExecutionStage stage{PathExecutionStage::kValidating};
+  std::size_t total_targets{0};
+  std::size_t queued_targets{0};
+  bool current_segment_valid{false};
+  std::size_t current_segment_index{0};
+  int32_t current_path_id{0};
+  bool actual_tcp_valid{false};
+  RigidTransform actual_tcp{};
+  double final_position_error_mm{0.0};
+  double final_orientation_error_deg{0.0};
+  uint64_t motion_callback_sequence{0};
+  bool motion_callback_post_start{false};
+  bool motion_callback_valid{false};
+  int32_t motion_callback_path_id{0};
+  int32_t motion_callback_previous_target_id{0};
+  int32_t motion_callback_next_target_id{0};
+  bool motion_callback_stopped{true};
+  int32_t motion_callback_left_path_count{0};
+  int64_t motion_callback_age_ms{-1};
+  bool motion_callback_path_matches{false};
+  bool observed_running_queue_evidence{false};
+  bool observed_terminal_queue_evidence{false};
+  bool final_in_tolerance{false};
+  int32_t har_motion_status{0};
+  uint64_t har_sample_sequence{0};
+  bool new_har_sample{false};
+  uint32_t stable_sample_count{0};
+  uint32_t required_stable_samples{0};
+  std::string completion_blocker{};
+  std::string diagnostic_summary{};
+};
+
+struct CartesianPathResult
+{
+  MotionResultCode code{MotionResultCode::kSdkError};
+  int64_t sdk_error{0};
+  std::vector<int32_t> path_ids{};
+  PathFailureStage failure_stage{PathFailureStage::kNone};
+  bool failure_target_index_valid{false};
+  std::size_t failure_target_index{0};
+  std::chrono::milliseconds execution_time{0};
+  std::string message{};
+};
+
 struct IoResult
 {
   bool success{false};
@@ -208,5 +287,6 @@ struct IoResult
 };
 
 using FeedbackCallback = std::function<void(const MotionFeedback &)>;
+using CartesianPathFeedbackCallback = std::function<void(const CartesianPathFeedback &)>;
 
 }  // namespace hikrobot_mpsdk_core

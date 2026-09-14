@@ -3,13 +3,12 @@
 #include <algorithm>
 #include <cmath>
 
-#include "MP_Public_Defines.h"
-
 namespace hikrobot_mpsdk_core
 {
 namespace
 {
 constexpr double kPi = 3.14159265358979323846;
+constexpr int32_t kMaxToolSlots = 10;  // MP_TOOL_NUM_MAX in MPSDK V2.4.0.
 
 Quaternion normalize(Quaternion q)
 {
@@ -128,12 +127,12 @@ bool cartesian_path_within_limits(
 
 bool valid_tool_id(int32_t id)
 {
-  return id >= 0 && id < MP_TOOL_NUM_MAX;
+  return id >= 0 && id < kMaxToolSlots;
 }
 
 bool valid_tool_count(int32_t count)
 {
-  return count >= 0 && count <= MP_TOOL_NUM_MAX;
+  return count >= 0 && count <= kMaxToolSlots;
 }
 
 std::string bounded_sdk_string(const char * value, std::size_t capacity)

@@ -12,6 +12,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/MoveL.action"
   "action/MoveC.action"
   "action/MoveS.action"
+  "action/FollowCartesianPath.action"
   "msg/RobotStatus.msg"
   "msg/ToolInfo.msg"
   "srv/SetDigitalOutput.srv"

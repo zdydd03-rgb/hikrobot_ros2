@@ -1,4 +1,7 @@
 #include "hikrobot_mpsdk_core/robot_runtime.hpp"
+#include "hikrobot_mpsdk_core/command_channel_health.hpp"
+#include "hikrobot_mpsdk_core/legacy_movel_queue_executor.hpp"
+#include "hikrobot_mpsdk_core/protected_arc_output.hpp"
 
 #include <algorithm>
 #include <array>
@@ -37,6 +40,17 @@ std::string hex_error(int64_t code)
   std::ostringstream oss;
   oss << "0x" << std::hex << std::uppercase << code;
   return oss.str();
+}
+
+std::string sdk_call_failure_message(const std::string & operation, int64_t code)
+{
+  if (code == kLocalSdkCommandBusy) {
+    return operation + " could not acquire the SDK command lock; retry after the current command returns";
+  }
+  if (code == kLocalSdkRecoveryRequired) {
+    return operation + " rejected because SDK command-channel recovery is required; restart the Driver process";
+  }
+  return operation + " failed: " + hex_error(code);
 }
 
 bool cartesian_target_reached(
@@ -132,7 +146,7 @@ ToolInfo tool_from_sdk(const ST_HAR_TOOL & source)
 
 }  // namespace
 
-struct RobotRuntime::Impl
+struct RobotRuntime::Impl : LegacyMoveLQueueBackend
 {
   struct RobotCache
   {
@@ -140,6 +154,7 @@ struct RobotRuntime::Impl
     std::condition_variable cv;
     ST_HAR_ROBOT_STATUS status{};
     bool received{false};
+    uint64_t sequence{0};
     std::chrono::steady_clock::time_point received_at{};
   };
 
@@ -148,15 +163,17 @@ struct RobotRuntime::Impl
     mutable std::mutex mutex;
     ST_MOTION_MOV_STATE state{};
     bool received{false};
+    uint64_t sequence{0};
     std::chrono::steady_clock::time_point received_at{};
   };
 
   RuntimeConfig config{};
+  mutable ProtectedArcOutputState arc_output_state{};
   MP_HANDLE handle{0};
-  bool connected{false};
+  mutable std::atomic_bool connected{false};
   bool subscribed{false};
-  bool configured{false};
-  bool active{false};
+  std::atomic_bool configured{false};
+  mutable std::atomic_bool active{false};
   bool control_acquired{false};
   bool authenticated{false};
   bool motion_callback_registered{false};
@@ -167,18 +184,24 @@ struct RobotRuntime::Impl
 
   ST_HAR_SUBSCRIBE_MESSAGE_DATA subscription{};
   ST_MOTION_CALLBACK_DATA motion_callback{};
+  ST_CALLBACK_DATA connection_callback{};
+  bool connection_callback_registered{false};
   RobotCache robot_cache{};
   MotionCache motion_cache{};
 
   std::unique_ptr<MotionSequenceManager> sequence;
 
-  mutable std::mutex sdk_mutex;
+  mutable std::timed_mutex sdk_mutex;
+  mutable CommandChannelHealth command_health;
   mutable std::mutex lifecycle_mutex;
   std::atomic_bool motion_busy{false};
+  mutable std::atomic_bool motion_recovery_required{false};
   std::atomic<int32_t> current_path_id{0};
-  std::atomic<int64_t> last_sdk_error{0};
+  std::atomic<uint64_t> stop_generation_counter{0};
+  mutable std::mutex start_stop_mutex;
+  mutable std::atomic<int64_t> last_sdk_error{0};
   mutable std::mutex error_mutex;
-  std::string last_error_message;
+  mutable std::string last_error_message;
 
   static void robot_status_callback(ST_COMMON_CALLBACK_DATA * data)
   {
@@ -191,6 +214,7 @@ struct RobotRuntime::Impl
       std::lock_guard<std::mutex> lock(cache->mutex);
       cache->status = *state;
       cache->received = true;
+      ++cache->sequence;
       cache->received_at = std::chrono::steady_clock::now();
     }
     cache->cv.notify_all();
@@ -206,21 +230,88 @@ struct RobotRuntime::Impl
     std::lock_guard<std::mutex> lock(cache->mutex);
     cache->state = *state;
     cache->received = true;
+    ++cache->sequence;
     cache->received_at = std::chrono::steady_clock::now();
   }
 
-  void set_error(int64_t sdk_error, const std::string & message)
+  void set_error(int64_t sdk_error, const std::string & message) const
   {
     last_sdk_error.store(sdk_error, std::memory_order_release);
     std::lock_guard<std::mutex> lock(error_mutex);
     last_error_message = message;
   }
 
-  int64_t call(const std::function<int64_t()> & fn)
+  static void connection_status_callback(ST_COMMON_CALLBACK_DATA * data)
   {
-    std::lock_guard<std::mutex> lock(sdk_mutex);
+    if (!data || !data->pData || !data->pUser) {
+      return;
+    }
+    auto * self = reinterpret_cast<Impl *>(data->pUser);
+    const bool is_connected = *reinterpret_cast<bool *>(data->pData);
+    self->connected.store(is_connected, std::memory_order_release);
+    if (self->configured.load(std::memory_order_acquire)) {
+      self->command_health.on_connection_status(is_connected);
+      if (!is_connected) {
+        self->arc_output_state.reset_unknown();
+        self->active.store(false, std::memory_order_release);
+        self->motion_recovery_required.store(true, std::memory_order_release);
+        self->set_error(
+          kLocalSdkRecoveryRequired,
+          "SDK connection callback reported disconnected; restart the Driver process before reuse");
+      }
+    }
+  }
+
+  CommandChannelSnapshot refresh_command_health() const
+  {
+    const auto snapshot = command_health.poll(
+      std::chrono::steady_clock::now(),
+      std::chrono::milliseconds(config.sdk_command_watchdog_ms));
+    if (snapshot.recovery_required) {
+      arc_output_state.reset_unknown();
+      connected.store(false, std::memory_order_release);
+      active.store(false, std::memory_order_release);
+      motion_recovery_required.store(true, std::memory_order_release);
+      set_error(snapshot.fault_code, snapshot.fault_message);
+    }
+    return snapshot;
+  }
+
+  int64_t call(
+    const std::function<int64_t()> & fn,
+    const std::string & operation = "SDK command")
+  {
+    if (configured.load(std::memory_order_acquire)) {
+      const auto health = refresh_command_health();
+      if (health.recovery_required) {
+        return kLocalSdkRecoveryRequired;
+      }
+    }
+
+    std::unique_lock<std::timed_mutex> lock(sdk_mutex, std::defer_lock);
+    if (!lock.try_lock_for(std::chrono::milliseconds(config.sdk_command_lock_timeout_ms))) {
+      const auto health = refresh_command_health();
+      if (health.recovery_required) {
+        return kLocalSdkRecoveryRequired;
+      }
+      set_error(
+        kLocalSdkCommandBusy,
+        operation + " could not acquire the SDK command lock; retry after the current command returns");
+      return kLocalSdkCommandBusy;
+    }
+
+    const bool monitor_health = configured.load(std::memory_order_acquire);
+    if (monitor_health) {
+      command_health.begin_call(operation, std::chrono::steady_clock::now());
+    }
     const int64_t ret = fn();
+    if (monitor_health) {
+      command_health.end_call(ret, operation, std::chrono::steady_clock::now());
+    }
     last_sdk_error.store(ret, std::memory_order_release);
+    if (configured.load(std::memory_order_acquire) && is_sdk_transport_error(ret)) {
+      (void)refresh_command_health();
+    }
     return ret;
   }
 
@@ -232,6 +323,7 @@ struct RobotRuntime::Impl
       return out;
     }
     const auto & s = robot_cache.status;
+    out.sequence = robot_cache.sequence;
     out.valid = true;
     out.received_at = robot_cache.received_at;
     out.stale = (std::chrono::steady_clock::now() - robot_cache.received_at) > stale_timeout;
@@ -262,6 +354,7 @@ struct RobotRuntime::Impl
     if (!motion_cache.received) {
       return out;
     }
+    out.sequence = motion_cache.sequence;
     out.valid = true;
     out.received_at = motion_cache.received_at;
     out.path_id = motion_cache.state.nPathID;
@@ -294,15 +387,93 @@ struct RobotRuntime::Impl
 
   int64_t stop_motion_internal()
   {
+    stop_generation_counter.fetch_add(1, std::memory_order_acq_rel);
+    std::lock_guard<std::mutex> start_stop_lock(start_stop_mutex);
     if (!handle || !realtime_entered) {
       return E_MP_SUCCESS;
     }
     return call([this]() {return MP_StopRealTimeMotion(handle);});
   }
 
+  int64_t clear_motion_targets() override
+  {
+    return call([this]() {return MP_ClearMotionTarget(handle);});
+  }
+
+  int64_t add_move_l(
+    int32_t path_id, int32_t target_id, const EulerPose & target,
+    const MotionOptions & options) override
+  {
+    ST_MOTION_MOV_PARAM param{};
+    param.nPathID = path_id;
+    fill_euler_target(param.stMotionTarget, target_id, target);
+    fill_ctrl_param(param.stMotionParam, options);
+    return call([this, &param]() {return MP_AddMovlTarget(handle, &param);});
+  }
+
+  GuardedStartResult start_motion_if_allowed(
+    uint64_t expected_stop_generation,
+    const std::atomic_bool * cancel_requested) override
+  {
+    std::lock_guard<std::mutex> start_stop_lock(start_stop_mutex);
+    if ((cancel_requested && cancel_requested->load(std::memory_order_acquire)) ||
+      stop_generation_counter.load(std::memory_order_acquire) != expected_stop_generation)
+    {
+      return {};
+    }
+    GuardedStartResult out;
+    out.attempted = true;
+    out.sdk_error = call([this]() {return MP_StartRealTimeMotion(handle);});
+    return out;
+  }
+
+  StopRequestResult request_stop() override
+  {
+    StopRequestResult out;
+    // Snapshot the callback generation immediately before requesting Stop. A
+    // cached callback from before this point cannot confirm this request, while
+    // a callback delivered during the blocking SDK call remains valid evidence.
+    {
+      std::lock_guard<std::mutex> lock(motion_cache.mutex);
+      out.motion_sequence_before_request = motion_cache.sequence;
+    }
+    out.requested_at = std::chrono::steady_clock::now();
+    out.sdk_error = stop_motion_internal();
+    return out;
+  }
+
+  uint64_t stop_generation() const override
+  {
+    return stop_generation_counter.load(std::memory_order_acquire);
+  }
+
+  RobotState robot_state(std::chrono::milliseconds stale_timeout) const override
+  {
+    return robot_state_snapshot(stale_timeout);
+  }
+
+  MotionState motion_state() const override
+  {
+    return motion_state_snapshot();
+  }
+
+  std::chrono::steady_clock::time_point now() const override
+  {
+    return std::chrono::steady_clock::now();
+  }
+
+  void sleep_for(std::chrono::milliseconds duration) override
+  {
+    std::this_thread::sleep_for(duration);
+  }
+
   void deactivate_internal()
   {
     active = false;
+    if (command_health.snapshot().recovery_required) {
+      current_path_id.store(0, std::memory_order_release);
+      return;
+    }
     if (realtime_entered && handle != 0) {
       (void)stop_motion_internal();
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -333,12 +504,33 @@ struct RobotRuntime::Impl
 
   void cleanup_internal()
   {
+    arc_output_state.reset_unknown();
     deactivate_internal();
+
+    if (command_health.snapshot().recovery_required) {
+      // A timed-out SDK call may still be executing with this handle. Destroying or
+      // reusing it would introduce a use-after-free/race inside the vendor SDK.
+      // Keep the process permanently poisoned and require process replacement.
+      configured.store(false, std::memory_order_release);
+      connected.store(false, std::memory_order_release);
+      active.store(false, std::memory_order_release);
+      current_path_id.store(0, std::memory_order_release);
+      return;
+    }
 
     if (subscribed && handle != 0) {
       (void)call([this]() {return MP_HAR_UnsubscribeMessage(handle, &subscription.stMessage);});
       subscribed = false;
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    if (connection_callback_registered && handle != 0) {
+      connection_callback.fCallback = nullptr;
+      connection_callback.pUserData = nullptr;
+      (void)call(
+        [this]() {return MP_SetUserCallback(handle, &connection_callback);},
+        "MP_SetUserCallback(reset connection status)");
+      connection_callback_registered = false;
     }
 
     if (connected && handle != 0) {
@@ -354,15 +546,21 @@ struct RobotRuntime::Impl
     }
 
     configured = false;
+    command_health.mark_clean_disconnected();
+    if (!command_health.snapshot().recovery_required) {
+      motion_recovery_required.store(false, std::memory_order_release);
+    }
     sequence.reset();
     {
       std::lock_guard<std::mutex> lock(robot_cache.mutex);
       robot_cache.received = false;
+      robot_cache.sequence = 0;
       robot_cache.status = {};
     }
     {
       std::lock_guard<std::mutex> lock(motion_cache.mutex);
       motion_cache.received = false;
+      motion_cache.sequence = 0;
       motion_cache.state = {};
     }
   }
@@ -384,9 +582,17 @@ struct RobotRuntime::Impl
       return result;
     }
 
-    if (!active || !realtime_entered) {
+    const auto health = refresh_command_health();
+    if (!active || !realtime_entered || !health.connected || health.recovery_required) {
       result.code = MotionResultCode::kDriverNotReady;
-      result.message = "driver is not active/realtime-ready";
+      result.message = health.recovery_required ? health.fault_message :
+        "driver is not active/realtime-ready or command-connected";
+      return result;
+    }
+    if (motion_recovery_required.load(std::memory_order_acquire)) {
+      result.code = MotionResultCode::kDriverNotReady;
+      result.message =
+        "motion recovery required; deactivate, cleanup, configure, and activate manually";
       return result;
     }
 
@@ -560,8 +766,22 @@ RobotRuntime::~RobotRuntime()
 bool RobotRuntime::configure(const RuntimeConfig & config, std::string & error)
 {
   std::lock_guard<std::mutex> lifecycle_lock(impl_->lifecycle_mutex);
+  if (impl_->command_health.snapshot().recovery_required) {
+    error = "SDK command channel recovery is required; restart the Driver process before configure";
+    impl_->set_error(kLocalSdkRecoveryRequired, error);
+    return false;
+  }
   impl_->cleanup_internal();
   impl_->config = config;
+  impl_->arc_output_state.reset_unknown();
+  if (config.sdk_command_lock_timeout_ms <= 0 || config.sdk_command_watchdog_ms <= 0 ||
+    config.sdk_command_watchdog_ms <= config.sdk_command_lock_timeout_ms)
+  {
+    error =
+      "sdk_command_lock_timeout_ms must be positive and less than sdk_command_watchdog_ms";
+    impl_->set_error(-1, error);
+    return false;
+  }
 
   impl_->handle = MP_CreateHandle();
   if (impl_->handle == 0) {
@@ -570,15 +790,30 @@ bool RobotRuntime::configure(const RuntimeConfig & config, std::string & error)
     return false;
   }
 
+  impl_->connection_callback = {};
+  impl_->connection_callback.eType = E_MP_CALLBACK_FUN_CONNECT_STATUS;
+  impl_->connection_callback.fCallback = Impl::connection_status_callback;
+  impl_->connection_callback.pUserData = impl_.get();
+  int64_t ret = impl_->call(
+    [this]() {return MP_SetUserCallback(impl_->handle, &impl_->connection_callback);},
+    "MP_SetUserCallback(connection status)");
+  if (ret != E_MP_SUCCESS) {
+    error = "MP_SetUserCallback(connection status) failed: " + hex_error(ret);
+    impl_->set_error(ret, error);
+    impl_->cleanup_internal();
+    return false;
+  }
+  impl_->connection_callback_registered = true;
+
   ST_ROBOT_CONNECT_INFO conn{};
   conn.stCtrlServerInfo.nPort = config.robot_port;
   std::strncpy(
     conn.stCtrlServerInfo.szIpAddr, config.robot_ip.c_str(),
     sizeof(conn.stCtrlServerInfo.szIpAddr) - 1);
 
-  int64_t ret = impl_->call([this, &conn]() {
+  ret = impl_->call([this, &conn]() {
     return MP_ConnectRobotWithIP(impl_->handle, &conn);
-  });
+  }, "MP_ConnectRobotWithIP");
   if (ret != E_MP_SUCCESS) {
     error = "MP_ConnectRobotWithIP failed: " + hex_error(ret);
     impl_->set_error(ret, error);
@@ -631,7 +866,14 @@ bool RobotRuntime::configure(const RuntimeConfig & config, std::string & error)
     return false;
   }
 
+  if (!impl_->connected.load(std::memory_order_acquire)) {
+    error = "controller disconnected while configure was completing";
+    impl_->set_error(kLocalSdkRecoveryRequired, error);
+    impl_->cleanup_internal();
+    return false;
+  }
   impl_->configured = true;
+  impl_->command_health.mark_configured_connected();
   impl_->set_error(E_MP_SUCCESS, "");
   return true;
 }
@@ -803,9 +1045,28 @@ void RobotRuntime::cleanup()
   impl_->cleanup_internal();
 }
 
-bool RobotRuntime::configured() const {return impl_->configured;}
-bool RobotRuntime::active() const {return impl_->active;}
+bool RobotRuntime::configured() const
+{
+  return impl_->configured.load(std::memory_order_acquire);
+}
+
+bool RobotRuntime::connected() const
+{
+  const auto health = impl_->refresh_command_health();
+  return configured() && impl_->connected.load(std::memory_order_acquire) && health.connected;
+}
+
+bool RobotRuntime::active() const
+{
+  return impl_->active.load(std::memory_order_acquire) && connected();
+}
+
 bool RobotRuntime::busy() const {return impl_->motion_busy.load(std::memory_order_acquire);}
+
+bool RobotRuntime::command_recovery_required() const
+{
+  return impl_->refresh_command_health().recovery_required;
+}
 
 RobotState RobotRuntime::robot_state() const
 {
@@ -820,28 +1081,37 @@ MotionState RobotRuntime::motion_state() const
 ToolResult RobotRuntime::get_active_tool()
 {
   ToolResult out;
-  if (!impl_->configured || !impl_->connected || impl_->handle == MP_INVALID_HANDLE) {
-    out.sdk_error = -1;
-    out.message = "runtime is not configured/connected";
+  const auto health = impl_->refresh_command_health();
+  if (!impl_->configured || !health.connected || health.recovery_required ||
+    impl_->handle == MP_INVALID_HANDLE)
+  {
+    out.sdk_error = health.fault_code == 0 ? kLocalSdkRecoveryRequired : health.fault_code;
+    out.message = health.fault_message.empty() ?
+      "runtime is not configured/connected" : health.fault_message;
     return out;
   }
 
   ST_TOOL_SIMPLE_INFO active{};
   ST_HAR_TOOL detail{};
   int64_t ret = E_MP_SUCCESS;
-  {
-    std::lock_guard<std::mutex> lock(impl_->sdk_mutex);
-    ret = MP_GetActivateTool(impl_->handle, &active);
-    if (ret == E_MP_SUCCESS && !valid_tool_id(active.nToolID)) {
-      out.sdk_error = -1;
-      out.message = "MP_GetActivateTool returned out-of-range Tool ID";
-      return out;
+  bool invalid_tool_id = false;
+  ret = impl_->call([this, &active, &detail, &invalid_tool_id]() {
+    int64_t current = MP_GetActivateTool(impl_->handle, &active);
+    if (current == E_MP_SUCCESS && !valid_tool_id(active.nToolID)) {
+      invalid_tool_id = true;
+      return static_cast<int64_t>(-1);
     }
-    if (ret == E_MP_SUCCESS) {
+    if (current == E_MP_SUCCESS) {
       ST_TOOL_INDEX index{};
       index.nToolID = active.nToolID;
-      ret = MP_HAR_GetToolInfo(impl_->handle, &index, &detail);
+      current = MP_HAR_GetToolInfo(impl_->handle, &index, &detail);
     }
+    return current;
+  }, "read active Tool snapshot");
+  if (invalid_tool_id) {
+    out.sdk_error = -1;
+    out.message = "MP_GetActivateTool returned out-of-range Tool ID";
+    return out;
   }
   if (ret != E_MP_SUCCESS) {
     out.sdk_error = ret;
@@ -857,18 +1127,20 @@ ToolResult RobotRuntime::get_active_tool()
 ToolListResult RobotRuntime::get_tool_info_list()
 {
   ToolListResult out;
-  if (!impl_->configured || !impl_->connected || impl_->handle == MP_INVALID_HANDLE) {
-    out.sdk_error = -1;
-    out.message = "runtime is not configured/connected";
+  const auto health = impl_->refresh_command_health();
+  if (!impl_->configured || !health.connected || health.recovery_required ||
+    impl_->handle == MP_INVALID_HANDLE)
+  {
+    out.sdk_error = health.fault_code == 0 ? kLocalSdkRecoveryRequired : health.fault_code;
+    out.message = health.fault_message.empty() ?
+      "runtime is not configured/connected" : health.fault_message;
     return out;
   }
 
   ST_HAR_TOOL_LIST list{};
-  int64_t ret = E_MP_SUCCESS;
-  {
-    std::lock_guard<std::mutex> lock(impl_->sdk_mutex);
-    ret = MP_HAR_GetToolInfoList(impl_->handle, &list);
-  }
+  const int64_t ret = impl_->call(
+    [this, &list]() {return MP_HAR_GetToolInfoList(impl_->handle, &list);},
+    "MP_HAR_GetToolInfoList");
   if (ret != E_MP_SUCCESS) {
     out.sdk_error = ret;
     out.message = "MP_HAR_GetToolInfoList failed: " + hex_error(ret);
@@ -992,6 +1264,29 @@ MotionResult RobotRuntime::execute_move_s(
     feedback, cancel_requested);
 }
 
+CartesianPathResult RobotRuntime::execute_follow_cartesian_path(
+  const FollowCartesianPathRequest & request,
+  const CartesianPathFeedbackCallback & feedback,
+  const std::atomic_bool * cancel_requested)
+{
+  if (!impl_->sequence) {
+    CartesianPathResult out;
+    out.code = MotionResultCode::kDriverNotReady;
+    out.failure_stage = PathFailureStage::kValidation;
+    out.message = "PathID manager is not configured";
+    return out;
+  }
+  LegacyMoveLQueueExecutor executor(
+    *impl_, *impl_->sequence, impl_->motion_busy, impl_->motion_recovery_required,
+    impl_->current_path_id, impl_->config.sequence_collision_retries);
+  auto result = executor.execute(
+    request, active() && impl_->realtime_entered, feedback, cancel_requested);
+  impl_->set_error(
+    result.sdk_error,
+    result.code == MotionResultCode::kSuccess ? std::string{} : result.message);
+  return result;
+}
+
 int64_t RobotRuntime::stop_motion()
 {
   return impl_->stop_motion_internal();
@@ -1000,9 +1295,22 @@ int64_t RobotRuntime::stop_motion()
 IoResult RobotRuntime::set_digital_output(const std::string & name, bool value)
 {
   IoResult out;
-  if (!impl_->configured || impl_->handle == 0) {
-    out.message = "runtime is not configured";
+  const auto health = impl_->refresh_command_health();
+  if (health.recovery_required) {
+    out.sdk_error = health.fault_code == 0 ? kLocalSdkRecoveryRequired : health.fault_code;
+    out.message = health.fault_message;
     return out;
+  }
+  if (!impl_->configured || !health.connected || impl_->handle == 0) {
+    out.sdk_error = kLocalSdkRecoveryRequired;
+    out.message = "runtime command channel is not configured/connected";
+    return out;
+  }
+
+  const bool protected_output = name == impl_->config.arc_output_name;
+  std::unique_lock<std::mutex> arc_lock;
+  if (protected_output) {
+    arc_lock = impl_->arc_output_state.lock();
   }
 
   ST_IO_LEVEL_INFO info{};
@@ -1011,13 +1319,21 @@ IoResult RobotRuntime::set_digital_output(const std::string & name, bool value)
   info.stIOLevelValue.nValue = value ? 1 : 0;
   const int64_t ret = impl_->call([this, &info]() {
     return MP_SetConfigIOLevelStatus(impl_->handle, &info);
-  });
+  }, "MP_SetConfigIOLevelStatus(DO)");
   out.success = ret == E_MP_SUCCESS;
   out.value = value;
   out.sdk_error = ret;
-  out.message = out.success ? "ok" : "MP_SetConfigIOLevelStatus failed: " + hex_error(ret);
+  out.message = out.success ? "ok" : sdk_call_failure_message("MP_SetConfigIOLevelStatus", ret);
+  if (protected_output) {
+    impl_->arc_output_state.write_result_locked(value, out.success);
+  }
   if (!out.success) {
-    impl_->set_error(ret, out.message);
+    const auto after = impl_->refresh_command_health();
+    if (after.recovery_required && !after.fault_message.empty()) {
+      out.sdk_error = after.fault_code;
+      out.message = after.fault_message;
+    }
+    impl_->set_error(out.sdk_error, out.message);
   }
   return out;
 }
@@ -1025,9 +1341,30 @@ IoResult RobotRuntime::set_digital_output(const std::string & name, bool value)
 IoResult RobotRuntime::get_digital_output(const std::string & name) const
 {
   IoResult out;
-  if (!impl_->configured || impl_->handle == 0) {
-    out.message = "runtime is not configured";
+  const auto health = impl_->refresh_command_health();
+  if (health.recovery_required) {
+    out.sdk_error = health.fault_code == 0 ? kLocalSdkRecoveryRequired : health.fault_code;
+    out.message = health.fault_message;
     return out;
+  }
+  if (!impl_->configured || !health.connected || impl_->handle == 0) {
+    out.sdk_error = kLocalSdkRecoveryRequired;
+    out.message = "runtime command channel is not configured/connected";
+    return out;
+  }
+
+  const bool protected_output = name == impl_->config.arc_output_name;
+  std::unique_lock<std::mutex> arc_lock;
+  if (protected_output) {
+    arc_lock = impl_->arc_output_state.lock();
+    if (impl_->arc_output_state.state_locked() == ProtectedOutputState::ASSERTED) {
+      out.value = true;
+      out.sdk_error = kLocalProtectedOutputReadSuppressed;
+      out.message =
+        "hardware readback suppressed while protected arc output is asserted; "
+        "cached commanded state=true";
+      return out;
+    }
   }
 
   ST_IO_LEVEL_ATTR attr{};
@@ -1037,13 +1374,25 @@ IoResult RobotRuntime::get_digital_output(const std::string & name) const
   ST_IO_LEVEL_VALUE value{};
   const int64_t ret = impl_->call([this, &attr, &value]() {
     return MP_GetConfigIOLevelStatus(impl_->handle, &attr, &value);
-  });
+  }, "MP_GetConfigIOLevelStatus(DO)");
   out.success = ret == E_MP_SUCCESS;
   out.value = value.nValue != 0;
   out.sdk_error = ret;
-  out.message = out.success ? "ok" : "MP_GetConfigIOLevelStatus(DO) failed: " + hex_error(ret);
+  out.message = out.success ? "ok" : sdk_call_failure_message("MP_GetConfigIOLevelStatus(DO)", ret);
+  if (protected_output) {
+    if (out.success) {
+      impl_->arc_output_state.read_result_locked(out.value);
+    } else {
+      impl_->arc_output_state.mark_unknown_locked();
+    }
+  }
   if (!out.success) {
-    impl_->set_error(ret, out.message);
+    const auto after = impl_->refresh_command_health();
+    if (after.recovery_required && !after.fault_message.empty()) {
+      out.sdk_error = after.fault_code;
+      out.message = after.fault_message;
+    }
+    impl_->set_error(out.sdk_error, out.message);
   }
   return out;
 }
@@ -1051,8 +1400,15 @@ IoResult RobotRuntime::get_digital_output(const std::string & name) const
 IoResult RobotRuntime::get_digital_input(const std::string & name) const
 {
   IoResult out;
-  if (!impl_->configured || impl_->handle == 0) {
-    out.message = "runtime is not configured";
+  const auto health = impl_->refresh_command_health();
+  if (health.recovery_required) {
+    out.sdk_error = health.fault_code == 0 ? kLocalSdkRecoveryRequired : health.fault_code;
+    out.message = health.fault_message;
+    return out;
+  }
+  if (!impl_->configured || !health.connected || impl_->handle == 0) {
+    out.sdk_error = kLocalSdkRecoveryRequired;
+    out.message = "runtime command channel is not configured/connected";
     return out;
   }
 
@@ -1063,13 +1419,18 @@ IoResult RobotRuntime::get_digital_input(const std::string & name) const
   ST_IO_LEVEL_VALUE value{};
   const int64_t ret = impl_->call([this, &attr, &value]() {
     return MP_GetConfigIOLevelStatus(impl_->handle, &attr, &value);
-  });
+  }, "MP_GetConfigIOLevelStatus(DI)");
   out.success = ret == E_MP_SUCCESS;
   out.value = value.nValue != 0;
   out.sdk_error = ret;
-  out.message = out.success ? "ok" : "MP_GetConfigIOLevelStatus(DI) failed: " + hex_error(ret);
+  out.message = out.success ? "ok" : sdk_call_failure_message("MP_GetConfigIOLevelStatus(DI)", ret);
   if (!out.success) {
-    impl_->set_error(ret, out.message);
+    const auto after = impl_->refresh_command_health();
+    if (after.recovery_required && !after.fault_message.empty()) {
+      out.sdk_error = after.fault_code;
+      out.message = after.fault_message;
+    }
+    impl_->set_error(out.sdk_error, out.message);
   }
   return out;
 }
@@ -1084,7 +1445,7 @@ std::vector<std::string> RobotRuntime::list_digital_outputs(int64_t & sdk_error)
   ST_IO_ATTRIBUTE_LIST_DEPRECATED list{};
   sdk_error = impl_->call([this, &list]() {
     return MP_GetConfigIOAttributeList_Deprecated(impl_->handle, &list);
-  });
+  }, "MP_GetConfigIOAttributeList_Deprecated");
   if (sdk_error != E_MP_SUCCESS) {
     return out;
   }

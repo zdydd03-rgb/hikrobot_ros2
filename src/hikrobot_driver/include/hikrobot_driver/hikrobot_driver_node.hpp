@@ -22,6 +22,7 @@
 #include "hikrobot_msgs/action/move_l.hpp"
 #include "hikrobot_msgs/action/move_c.hpp"
 #include "hikrobot_msgs/action/move_s.hpp"
+#include "hikrobot_msgs/action/follow_cartesian_path.hpp"
 #include "hikrobot_msgs/msg/robot_status.hpp"
 #include "hikrobot_msgs/msg/tool_info.hpp"
 #include "hikrobot_msgs/srv/set_digital_output.hpp"
@@ -53,10 +54,13 @@ private:
   using MoveL = hikrobot_msgs::action::MoveL;
   using MoveC = hikrobot_msgs::action::MoveC;
   using MoveS = hikrobot_msgs::action::MoveS;
+  using FollowCartesianPath = hikrobot_msgs::action::FollowCartesianPath;
   using GoalHandleMoveJ = rclcpp_action::ServerGoalHandle<MoveJ>;
   using GoalHandleMoveL = rclcpp_action::ServerGoalHandle<MoveL>;
   using GoalHandleMoveC = rclcpp_action::ServerGoalHandle<MoveC>;
   using GoalHandleMoveS = rclcpp_action::ServerGoalHandle<MoveS>;
+  using GoalHandleFollowCartesianPath =
+    rclcpp_action::ServerGoalHandle<FollowCartesianPath>;
 
   void declare_parameters();
   void create_ros_interfaces();
@@ -72,12 +76,18 @@ private:
     const rclcpp_action::GoalUUID &, std::shared_ptr<const MoveC::Goal> goal);
   rclcpp_action::GoalResponse handle_move_s_goal(
     const rclcpp_action::GoalUUID &, std::shared_ptr<const MoveS::Goal> goal);
+  rclcpp_action::GoalResponse handle_follow_cartesian_path_goal(
+    const rclcpp_action::GoalUUID &,
+    std::shared_ptr<const FollowCartesianPath::Goal> goal);
 
   rclcpp_action::CancelResponse handle_cancel();
   void accept_move_j(const std::shared_ptr<GoalHandleMoveJ> goal_handle);
   void accept_move_l(const std::shared_ptr<GoalHandleMoveL> goal_handle);
   void accept_move_c(const std::shared_ptr<GoalHandleMoveC> goal_handle);
   void accept_move_s(const std::shared_ptr<GoalHandleMoveS> goal_handle);
+  void accept_follow_cartesian_path(
+    const std::shared_ptr<GoalHandleFollowCartesianPath> goal_handle);
+  void request_motion_cancel();
 
   hikrobot_mpsdk_core::MotionOptions options_from_goal(
     uint8_t speed_percent, uint8_t blend_radius,
@@ -105,6 +115,8 @@ private:
   std::atomic_bool ros_active_{false};
   std::atomic_bool goal_reserved_{false};
   std::atomic_bool cancel_requested_{false};
+  mutable std::mutex path_cancel_mutex_;
+  std::shared_ptr<std::atomic_bool> path_cancel_token_;
   std::thread motion_worker_;
   mutable std::mutex worker_mutex_;
   mutable std::mutex active_tool_mutex_;
@@ -121,6 +133,10 @@ private:
   double orientation_tolerance_rad_{0.0174532925};
   int stable_samples_{5};
   int state_stale_timeout_ms_{1000};
+  int stop_confirmation_timeout_ms_{3000};
+  int sdk_command_lock_timeout_ms_{1000};
+  int sdk_command_watchdog_ms_{3000};
+  std::string arc_output_name_{"start"};
   int tool_id_{0};
   int workpiece_id_{-1};
   double max_cartesian_translation_step_m_{0.05};
@@ -132,11 +148,15 @@ private:
   rclcpp_lifecycle::LifecyclePublisher<hikrobot_msgs::msg::RobotStatus>::SharedPtr status_pub_;
   rclcpp_lifecycle::LifecyclePublisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_pub_;
   rclcpp::TimerBase::SharedPtr state_timer_;
+  rclcpp::CallbackGroup::SharedPtr state_callback_group_;
+  rclcpp::CallbackGroup::SharedPtr sdk_service_callback_group_;
+  rclcpp::CallbackGroup::SharedPtr stop_callback_group_;
 
   rclcpp_action::Server<MoveJ>::SharedPtr move_j_server_;
   rclcpp_action::Server<MoveL>::SharedPtr move_l_server_;
   rclcpp_action::Server<MoveC>::SharedPtr move_c_server_;
   rclcpp_action::Server<MoveS>::SharedPtr move_s_server_;
+  rclcpp_action::Server<FollowCartesianPath>::SharedPtr follow_cartesian_path_server_;
 
   rclcpp::Service<hikrobot_msgs::srv::SetDigitalOutput>::SharedPtr set_do_service_;
   rclcpp::Service<hikrobot_msgs::srv::GetDigitalOutput>::SharedPtr get_do_service_;

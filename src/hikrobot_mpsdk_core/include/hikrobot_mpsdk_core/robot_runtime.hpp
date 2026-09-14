@@ -16,6 +16,9 @@ struct RuntimeConfig
   std::string robot_ip{"192.168.2.64"};
   int robot_port{9000};
   uint32_t har_publish_ms{50};
+  int sdk_command_lock_timeout_ms{1000};
+  int sdk_command_watchdog_ms{3000};
+  std::string arc_output_name{"start"};
   std::string sequence_state_file{"/tmp/hikrobot_path_id.state"};
   int sequence_collision_retries{3};
 };
@@ -35,8 +38,10 @@ public:
   void cleanup();
 
   bool configured() const;
+  bool connected() const;
   bool active() const;
   bool busy() const;
+  bool command_recovery_required() const;
 
   RobotState robot_state() const;
   MotionState motion_state() const;
@@ -58,6 +63,10 @@ public:
   MotionResult execute_move_s(
     const MoveSRequest & request,
     const FeedbackCallback & feedback,
+    const std::atomic_bool * cancel_requested);
+  CartesianPathResult execute_follow_cartesian_path(
+    const FollowCartesianPathRequest & request,
+    const CartesianPathFeedbackCallback & feedback,
     const std::atomic_bool * cancel_requested);
 
   int64_t stop_motion();

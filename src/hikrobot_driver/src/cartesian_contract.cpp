@@ -1,5 +1,6 @@
 #include "hikrobot_driver/cartesian_contract.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 #include "tf2/LinearMath/Matrix3x3.h"
@@ -32,13 +33,25 @@ bool cartesian_pose_to_sdk(
     return false;
   }
 
-  tf2::Quaternion q;
-  tf2::fromMsg(input.pose.orientation, q);
-  if (q.length2() < 1e-12) {
+  const double scale = std::max(
+    std::max(std::abs(o.x), std::abs(o.y)),
+    std::max(std::abs(o.z), std::abs(o.w)));
+  if (scale < 1e-12) {
     error = "target quaternion has zero length";
     return false;
   }
-  q.normalize();
+  const double sx = o.x / scale;
+  const double sy = o.y / scale;
+  const double sz = o.z / scale;
+  const double sw = o.w / scale;
+  const double scaled_norm = std::sqrt(sx * sx + sy * sy + sz * sz + sw * sw);
+  tf2::Quaternion q(sx / scaled_norm, sy / scaled_norm, sz / scaled_norm, sw / scaled_norm);
+  if (!std::isfinite(q.x()) || !std::isfinite(q.y()) ||
+    !std::isfinite(q.z()) || !std::isfinite(q.w()))
+  {
+    error = "target quaternion normalization produced a non-finite value";
+    return false;
+  }
   double roll = 0.0;
   double pitch = 0.0;
   double yaw = 0.0;
@@ -51,7 +64,8 @@ bool cartesian_pose_to_sdk(
   output.pitch_deg = pitch * kRadToDeg;
   output.yaw_deg = yaw * kRadToDeg;
   if (!std::isfinite(output.x_mm) || !std::isfinite(output.y_mm) ||
-    !std::isfinite(output.z_mm))
+    !std::isfinite(output.z_mm) || !std::isfinite(output.roll_deg) ||
+    !std::isfinite(output.pitch_deg) || !std::isfinite(output.yaw_deg))
   {
     error = "Cartesian target is outside the representable SDK range";
     return false;
@@ -79,6 +93,16 @@ bool apply_base_cartesian_options(
   options.coordinate_type = 1;
   options.coordinate_id = 0;
   options.workpiece_id = -1;
+  return true;
+}
+
+bool valid_action_duration(
+  const builtin_interfaces::msg::Duration & duration, std::string & error)
+{
+  if (duration.sec < 0 || duration.nanosec >= 1000000000U) {
+    error = "timeout must be zero or a non-negative normalized Duration";
+    return false;
+  }
   return true;
 }
 

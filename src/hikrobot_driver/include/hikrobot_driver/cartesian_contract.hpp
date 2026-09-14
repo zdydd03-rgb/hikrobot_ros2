@@ -2,6 +2,7 @@
 
 #include <string>
 
+#include "builtin_interfaces/msg/duration.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "hikrobot_mpsdk_core/types.hpp"
 
@@ -15,5 +16,8 @@ bool cartesian_pose_to_sdk(
 bool apply_base_cartesian_options(
   bool active_tool_valid, const hikrobot_mpsdk_core::ToolInfo & active_tool,
   hikrobot_mpsdk_core::MotionOptions & options, std::string & error);
+
+bool valid_action_duration(
+  const builtin_interfaces::msg::Duration & duration, std::string & error);
 
 }  // namespace hikrobot_driver

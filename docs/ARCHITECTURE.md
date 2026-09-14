@@ -80,6 +80,25 @@ The driver therefore:
 - retries only the Add stage when the exact error is `0x82068043`;
 - never automatically repeats a motion after `MP_StartRealTimeMotion` has been attempted successfully, because execution may already have started.
 
+### FollowCartesianPath (software-only)
+
+`follow_cartesian_path` accepts 1..32 ordered `base_frame` Active-Tool TCP poses. The driver
+validates every pose, the timeout and the configured 50 mm/10 degree per-segment guard before
+allocating IDs. The core then reserves and persists two IDs per point, clears the legacy queue,
+adds each `ST_MOTION_MOV_PARAM` with Base coordinate `1:0`, `nToolId` from one Active Tool
+snapshot and `nWorkPieceId=-1`, and calls `MP_StartRealTimeMotion` exactly once. It does not
+chain ROS MoveL actions or use Motion API2. A collision retry is permitted only before Start and
+requeues the complete path with a fresh persisted block.
+
+Feedback and completion use the same Tool snapshot to compose HAR `^B T_F` into
+`^B T_TCP = ^B T_F × ^F T_Tool`. Completion requires post-Start matching motion-callback queue
+evidence, distinct HAR samples, a stopped terminal callback referencing the final target, and
+TCP tolerance. Progress percentage is deliberately not synthesized from time or `dPercent`.
+Cancellation, StopMotion and lifecycle stops are serialized with Start and map to the existing
+Action CANCELED/ABORTED semantics. Start uncertainty or failed queue cleanup blocks subsequent
+motion until lifecycle cleanup. This implementation is not yet validated against controller
+2.1.2 for continuous queue behavior; MoveC/MoveS and online visual correction remain separate.
+
 ## Units
 
 ROS boundary:

@@ -108,6 +108,36 @@ TEST(CartesianContract, NormalizesQuaternionAndConvertsToZyxEulerDegrees)
   EXPECT_NEAR(sdk.yaw_deg, 0.3 * 180.0 / kPi, 1e-9);
 }
 
+TEST(CartesianContract, SafelyNormalizesVeryLargeFiniteQuaternion)
+{
+  auto pose = valid_pose();
+  pose.pose.orientation.x = std::numeric_limits<double>::max();
+  pose.pose.orientation.y = std::numeric_limits<double>::max();
+  pose.pose.orientation.z = 0.0;
+  pose.pose.orientation.w = 0.0;
+  hc::EulerPose sdk;
+  std::string error;
+  ASSERT_TRUE(hd::cartesian_pose_to_sdk(pose, "base_link", sdk, error));
+  EXPECT_TRUE(std::isfinite(sdk.roll_deg));
+  EXPECT_TRUE(std::isfinite(sdk.pitch_deg));
+  EXPECT_TRUE(std::isfinite(sdk.yaw_deg));
+}
+
+TEST(CartesianContract, ValidatesNormalizedOrZeroDuration)
+{
+  builtin_interfaces::msg::Duration duration;
+  std::string error;
+  EXPECT_TRUE(hd::valid_action_duration(duration, error));
+  duration.sec = 1;
+  duration.nanosec = 999999999U;
+  EXPECT_TRUE(hd::valid_action_duration(duration, error));
+  duration.sec = -1;
+  EXPECT_FALSE(hd::valid_action_duration(duration, error));
+  duration.sec = 0;
+  duration.nanosec = 1000000000U;
+  EXPECT_FALSE(hd::valid_action_duration(duration, error));
+}
+
 TEST(CartesianContract, UsesControllerActiveToolAndBaseCoordinate)
 {
   hc::ToolInfo tool;

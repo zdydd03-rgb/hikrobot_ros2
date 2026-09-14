@@ -18,13 +18,17 @@
 - no automatic resend after `MP_StartRealTimeMotion`
 - DO write/read based on the HIL 06D path; DI read from the same public IO API
 - lifecycle driver publishers/services/actions
-- automatic lifecycle bringup configuration and activation
+- bringup launches an unconfigured lifecycle node; configure and activate are manual operations
 - HIL regression plan
 - lifecycle-aware `/flange_pose` (`^B T_F`) and `/tcp_pose` (`^B T_TCP`) publication
 - read-only controller Active Tool query, cache, and ROS services
 - strict Base-frame Active-Tool TCP contract for MoveL, MoveC, and MoveS
 - per-segment 50 mm / 10 degree Cartesian pre-Add guards
 - TCP-based Cartesian feedback and stable completion using a per-motion Tool snapshot
+- FollowCartesianPath Legacy MoveL queue executor (1..32 points), guarded validation, complete
+  PathID-block reservation, bounded pre-Start collision retry, and conservative completion
+- independent 3000 ms FollowCartesianPath stop-confirmation deadline, sequence-based Motion/HAR
+  freshness, and raw completion-blocker diagnostics
 
 ## Verification completed
 
@@ -47,9 +51,20 @@ The Ubuntu 22.04 + ROS 2 Humble development machine completed a full workspace b
 ## Pending or deferred
 
 - IO/DO HIL is deferred.
+
+The protected welding output (`arc_output_name`, default `start`) now tracks
+UNKNOWN/LOW/ASSERTED. A successful high write publishes ASSERTED and a
+successful low write publishes LOW; failures, disconnect, cleanup, and command
+watchdog recovery publish UNKNOWN. Hardware DO readback is suppressed while
+ASSERTED to prevent blocking the SDK command channel. This is source-level and
+offline-test work only; no real arc HIL has been rerun.
 - MoveC and MoveS have software tests but no physical HIL.
 - The complete automated visual three-point route and MoveL speed 3%/5% are not verified.
-- `FollowCartesianPath`, a dynamic visual-coordinate transform node, image-time/historical
-  flange-pose synchronization, and Driver hand-eye integration are not implemented.
+- FollowCartesianPath has software implementation and offline tests, but no controller HIL yet.
+- The stop-deadline repair and completion diagnostics have offline coverage only; the physical
+  single-point arrival did not produce retained raw Legacy callback evidence, so strict final
+  callback compatibility remains pending controller 2.1.2 HIL.
+- A dynamic visual-coordinate transform node, image-time/historical flange-pose synchronization,
+  and Driver hand-eye integration are not implemented.
 
 See `docs/hil/` for reviewed HIL evidence and exact limitations.

@@ -1,5 +1,6 @@
 #include "hikrobot_driver/hikrobot_driver_node.hpp"
 #include "hikrobot_driver/cartesian_contract.hpp"
+#include "hikrobot_mpsdk_core/legacy_movel_queue_executor.hpp"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,25 @@ namespace
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kRadToDeg = 180.0 / kPi;
 constexpr double kDegToRad = kPi / 180.0;
+
+template<typename Fn>
+class ScopeExit
+{
+public:
+  explicit ScopeExit(Fn fn) : fn_(std::move(fn)) {}
+  ScopeExit(const ScopeExit &) = delete;
+  ScopeExit & operator=(const ScopeExit &) = delete;
+  ~ScopeExit() {fn_();}
+
+private:
+  Fn fn_;
+};
+
+template<typename Fn>
+ScopeExit<Fn> make_scope_exit(Fn fn)
+{
+  return ScopeExit<Fn>(std::move(fn));
+}
 
 builtin_interfaces::msg::Duration duration_from_ms(std::chrono::milliseconds value)
 {
@@ -53,8 +73,8 @@ HikrobotDriverNode::HikrobotDriverNode(const rclcpp::NodeOptions & options)
 HikrobotDriverNode::~HikrobotDriverNode()
 {
   ros_active_.store(false);
-  cancel_requested_.store(true);
-  if (core_) {
+  request_motion_cancel();
+  if (core_ && !core_->command_recovery_required()) {
     (void)core_->stop_motion();
   }
   join_motion_worker();
@@ -81,6 +101,10 @@ void HikrobotDriverNode::declare_parameters()
   declare_parameter<double>("orientation_tolerance_rad", 0.0174532925);  // 1 deg
   declare_parameter<int>("stable_samples", 5);
   declare_parameter<int>("state_stale_timeout_ms", 1000);
+  declare_parameter<int>("stop_confirmation_timeout_ms", 3000);
+  declare_parameter<int>("sdk_command_lock_timeout_ms", 1000);
+  declare_parameter<int>("sdk_command_watchdog_ms", 3000);
+  declare_parameter<std::string>("arc_output_name", "start");
   declare_parameter<int>("tool_id", 0);
   declare_parameter<int>("workpiece_id", -1);
   declare_parameter<double>("max_cartesian_translation_step_m", 0.05);
@@ -90,6 +114,10 @@ void HikrobotDriverNode::declare_parameters()
 
 void HikrobotDriverNode::create_ros_interfaces()
 {
+  state_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  sdk_service_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+  stop_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+
   joint_pub_ = create_publisher<sensor_msgs::msg::JointState>("/joint_states", rclcpp::SensorDataQoS());
   flange_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>("~/flange_pose", 10);
   tcp_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>("~/tcp_pose", 10);
@@ -99,7 +127,7 @@ void HikrobotDriverNode::create_ros_interfaces()
   const double hz = std::max(1.0, get_parameter("state_publish_rate_hz").as_double());
   state_timer_ = create_wall_timer(
     std::chrono::milliseconds(static_cast<int>(1000.0 / hz)),
-    std::bind(&HikrobotDriverNode::publish_state, this));
+    std::bind(&HikrobotDriverNode::publish_state, this), state_callback_group_);
 
   const auto base = get_node_base_interface();
   const auto clock = get_node_clock_interface();
@@ -130,22 +158,32 @@ void HikrobotDriverNode::create_ros_interfaces()
     [this](const std::shared_ptr<GoalHandleMoveS>) {return handle_cancel();},
     std::bind(&HikrobotDriverNode::accept_move_s, this, std::placeholders::_1));
 
+  follow_cartesian_path_server_ = rclcpp_action::create_server<FollowCartesianPath>(
+    base, clock, logging, waitables, "~/follow_cartesian_path",
+    std::bind(
+      &HikrobotDriverNode::handle_follow_cartesian_path_goal, this,
+      std::placeholders::_1, std::placeholders::_2),
+    [this](const std::shared_ptr<GoalHandleFollowCartesianPath>) {return handle_cancel();},
+    std::bind(
+      &HikrobotDriverNode::accept_follow_cartesian_path, this,
+      std::placeholders::_1));
+
   set_do_service_ = create_service<hikrobot_msgs::srv::SetDigitalOutput>(
     "~/set_digital_output",
     [this](
       const std::shared_ptr<hikrobot_msgs::srv::SetDigitalOutput::Request> req,
       std::shared_ptr<hikrobot_msgs::srv::SetDigitalOutput::Response> res)
     {
-      if (!ros_active_.load()) {
+      if (!ros_active_.load() || !core_->active()) {
         res->success = false;
-        res->message = "driver must be ACTIVE for DO writes";
+        res->message = "driver must be ACTIVE and command-connected for DO writes";
         return;
       }
       const auto result = core_->set_digital_output(req->name, req->value);
       res->success = result.success;
       res->sdk_error_code = result.sdk_error;
       res->message = result.message;
-    });
+    }, rmw_qos_profile_services_default, sdk_service_callback_group_);
 
   get_do_service_ = create_service<hikrobot_msgs::srv::GetDigitalOutput>(
     "~/get_digital_output",
@@ -158,7 +196,7 @@ void HikrobotDriverNode::create_ros_interfaces()
       res->value = result.value;
       res->sdk_error_code = result.sdk_error;
       res->message = result.message;
-    });
+    }, rmw_qos_profile_services_default, sdk_service_callback_group_);
 
   get_di_service_ = create_service<hikrobot_msgs::srv::GetDigitalInput>(
     "~/get_digital_input",
@@ -171,7 +209,7 @@ void HikrobotDriverNode::create_ros_interfaces()
       res->value = result.value;
       res->sdk_error_code = result.sdk_error;
       res->message = result.message;
-    });
+    }, rmw_qos_profile_services_default, sdk_service_callback_group_);
 
   stop_service_ = create_service<hikrobot_msgs::srv::StopMotion>(
     "~/stop_motion",
@@ -179,12 +217,15 @@ void HikrobotDriverNode::create_ros_interfaces()
       const std::shared_ptr<hikrobot_msgs::srv::StopMotion::Request>,
       std::shared_ptr<hikrobot_msgs::srv::StopMotion::Response> res)
     {
-      cancel_requested_.store(true, std::memory_order_release);
+      request_motion_cancel();
       const int64_t ret = core_->stop_motion();
       res->success = ret == 0;
       res->sdk_error_code = ret;
-      res->message = res->success ? "stop requested" : "MP_StopRealTimeMotion failed";
-    });
+      res->message = res->success ? "stop requested" : core_->last_error_message();
+      if (!res->success && res->message.empty()) {
+        res->message = "MP_StopRealTimeMotion failed";
+      }
+    }, rmw_qos_profile_services_default, stop_callback_group_);
 
   get_active_tool_service_ = create_service<hikrobot_msgs::srv::GetActiveTool>(
     "~/get_active_tool",
@@ -204,7 +245,7 @@ void HikrobotDriverNode::create_ros_interfaces()
         }
         res->tool = tool_info_to_ros(result.tool);
       }
-    });
+    }, rmw_qos_profile_services_default, sdk_service_callback_group_);
 
   get_tool_info_list_service_ = create_service<hikrobot_msgs::srv::GetToolInfoList>(
     "~/get_tool_info_list",
@@ -222,7 +263,7 @@ void HikrobotDriverNode::create_ros_interfaces()
           res->tools.push_back(tool_info_to_ros(tool));
         }
       }
-    });
+    }, rmw_qos_profile_services_default, sdk_service_callback_group_);
 }
 
 HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_configure(const rclcpp_lifecycle::State &)
@@ -241,12 +282,21 @@ HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_configure(const rclcpp
   orientation_tolerance_rad_ = get_parameter("orientation_tolerance_rad").as_double();
   stable_samples_ = get_parameter("stable_samples").as_int();
   state_stale_timeout_ms_ = get_parameter("state_stale_timeout_ms").as_int();
+  stop_confirmation_timeout_ms_ = get_parameter("stop_confirmation_timeout_ms").as_int();
+  sdk_command_lock_timeout_ms_ = get_parameter("sdk_command_lock_timeout_ms").as_int();
+  sdk_command_watchdog_ms_ = get_parameter("sdk_command_watchdog_ms").as_int();
+  arc_output_name_ = get_parameter("arc_output_name").as_string();
   tool_id_ = get_parameter("tool_id").as_int();
   workpiece_id_ = get_parameter("workpiece_id").as_int();
   max_cartesian_translation_step_m_ = get_parameter("max_cartesian_translation_step_m").as_double();
   max_cartesian_rotation_step_rad_ = get_parameter("max_cartesian_rotation_step_rad").as_double();
-  if (max_cartesian_translation_step_m_ <= 0.0 || max_cartesian_rotation_step_rad_ <= 0.0) {
-    RCLCPP_ERROR(get_logger(), "Cartesian step limits must be positive");
+  if (max_cartesian_translation_step_m_ <= 0.0 || max_cartesian_rotation_step_rad_ <= 0.0 ||
+    stop_confirmation_timeout_ms_ <= 0 || sdk_command_lock_timeout_ms_ <= 0 ||
+    sdk_command_watchdog_ms_ <= sdk_command_lock_timeout_ms_ || arc_output_name_.empty())
+  {
+    RCLCPP_ERROR(
+      get_logger(),
+      "Cartesian/stop limits must be positive and SDK lock timeout must be less than watchdog");
     return CallbackReturn::FAILURE;
   }
 
@@ -261,6 +311,9 @@ HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_configure(const rclcpp
   cfg.robot_ip = get_parameter("robot_ip").as_string();
   cfg.robot_port = get_parameter("robot_port").as_int();
   cfg.har_publish_ms = static_cast<uint32_t>(get_parameter("har_publish_ms").as_int());
+  cfg.sdk_command_lock_timeout_ms = sdk_command_lock_timeout_ms_;
+  cfg.sdk_command_watchdog_ms = sdk_command_watchdog_ms_;
+  cfg.arc_output_name = arc_output_name_;
   cfg.sequence_state_file = sequence_file;
   cfg.sequence_collision_retries = get_parameter("sequence_collision_retries").as_int();
 
@@ -324,7 +377,7 @@ HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_activate(const rclcpp_
 HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_deactivate(const rclcpp_lifecycle::State &)
 {
   ros_active_.store(false, std::memory_order_release);
-  cancel_requested_.store(true, std::memory_order_release);
+  request_motion_cancel();
   (void)core_->stop_motion();
   join_motion_worker();
   core_->deactivate();
@@ -342,7 +395,7 @@ HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_deactivate(const rclcp
 HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_cleanup(const rclcpp_lifecycle::State &)
 {
   ros_active_.store(false);
-  cancel_requested_.store(true);
+  request_motion_cancel();
   join_motion_worker();
   core_->cleanup();
   clear_active_tool_cache();
@@ -353,7 +406,7 @@ HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_cleanup(const rclcpp_l
 HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_shutdown(const rclcpp_lifecycle::State &)
 {
   ros_active_.store(false);
-  cancel_requested_.store(true);
+  request_motion_cancel();
   if (core_) {
     (void)core_->stop_motion();
   }
@@ -377,10 +430,19 @@ void HikrobotDriverNode::release_goal_reservation()
   goal_reserved_.store(false, std::memory_order_release);
 }
 
+void HikrobotDriverNode::request_motion_cancel()
+{
+  cancel_requested_.store(true, std::memory_order_release);
+  std::lock_guard<std::mutex> lock(path_cancel_mutex_);
+  if (path_cancel_token_) {
+    path_cancel_token_->store(true, std::memory_order_release);
+  }
+}
+
 rclcpp_action::GoalResponse HikrobotDriverNode::handle_move_j_goal(
   const rclcpp_action::GoalUUID &, std::shared_ptr<const MoveJ::Goal> goal)
 {
-  if (!ros_active_.load()) {
+  if (!ros_active_.load() || !core_->active()) {
     return rclcpp_action::GoalResponse::REJECT;
   }
   if (goal->positions.size() != 6 ||
@@ -399,7 +461,9 @@ rclcpp_action::GoalResponse HikrobotDriverNode::handle_move_j_goal(
 rclcpp_action::GoalResponse HikrobotDriverNode::handle_move_l_goal(
   const rclcpp_action::GoalUUID &, std::shared_ptr<const MoveL::Goal> goal)
 {
-  if (!ros_active_.load() || goal->speed_percent < 1 || goal->speed_percent > 100 || goal->blend_radius > 10) {
+  if (!ros_active_.load() || !core_->active() || goal->speed_percent < 1 ||
+    goal->speed_percent > 100 || goal->blend_radius > 10)
+  {
     return rclcpp_action::GoalResponse::REJECT;
   }
   bool expected = false;
@@ -412,7 +476,9 @@ rclcpp_action::GoalResponse HikrobotDriverNode::handle_move_l_goal(
 rclcpp_action::GoalResponse HikrobotDriverNode::handle_move_c_goal(
   const rclcpp_action::GoalUUID &, std::shared_ptr<const MoveC::Goal> goal)
 {
-  if (!ros_active_.load() || goal->speed_percent < 1 || goal->speed_percent > 100 || goal->blend_radius > 10) {
+  if (!ros_active_.load() || !core_->active() || goal->speed_percent < 1 ||
+    goal->speed_percent > 100 || goal->blend_radius > 10)
+  {
     return rclcpp_action::GoalResponse::REJECT;
   }
   bool expected = false;
@@ -425,7 +491,7 @@ rclcpp_action::GoalResponse HikrobotDriverNode::handle_move_c_goal(
 rclcpp_action::GoalResponse HikrobotDriverNode::handle_move_s_goal(
   const rclcpp_action::GoalUUID &, std::shared_ptr<const MoveS::Goal> goal)
 {
-  if (!ros_active_.load() || goal->via_poses.size() > 49 ||
+  if (!ros_active_.load() || !core_->active() || goal->via_poses.size() > 49 ||
     goal->speed_percent < 1 || goal->speed_percent > 100 || goal->blend_radius > 10)
   {
     return rclcpp_action::GoalResponse::REJECT;
@@ -437,9 +503,32 @@ rclcpp_action::GoalResponse HikrobotDriverNode::handle_move_s_goal(
   return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
 }
 
+rclcpp_action::GoalResponse HikrobotDriverNode::handle_follow_cartesian_path_goal(
+  const rclcpp_action::GoalUUID &,
+  std::shared_ptr<const FollowCartesianPath::Goal> goal)
+{
+  std::string duration_error;
+  if (!ros_active_.load() || !core_->active() || goal->poses.empty() ||
+    goal->poses.size() > hikrobot_mpsdk_core::kMaxFollowCartesianPathTargets ||
+    goal->speed_percent < 1 || goal->speed_percent > 100 || goal->blend_radius > 10 ||
+    !valid_action_duration(goal->timeout, duration_error))
+  {
+    return rclcpp_action::GoalResponse::REJECT;
+  }
+  bool expected = false;
+  if (!goal_reserved_.compare_exchange_strong(expected, true)) {
+    return rclcpp_action::GoalResponse::REJECT;
+  }
+  {
+    std::lock_guard<std::mutex> lock(path_cancel_mutex_);
+    path_cancel_token_ = std::make_shared<std::atomic_bool>(false);
+  }
+  return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+}
+
 rclcpp_action::CancelResponse HikrobotDriverNode::handle_cancel()
 {
-  cancel_requested_.store(true, std::memory_order_release);
+  request_motion_cancel();
   return rclcpp_action::CancelResponse::ACCEPT;
 }
 
@@ -460,6 +549,8 @@ hikrobot_mpsdk_core::MotionOptions HikrobotDriverNode::options_from_goal(
   out.orientation_tolerance_deg = orientation_tolerance_rad_ * kRadToDeg;
   out.stable_samples = stable_samples_;
   out.state_stale_timeout = std::chrono::milliseconds(state_stale_timeout_ms_);
+  out.stop_confirmation_timeout =
+    std::chrono::milliseconds(stop_confirmation_timeout_ms_);
   return out;
 }
 
@@ -528,12 +619,11 @@ bool HikrobotDriverNode::prepare_cartesian_goal(
   std::vector<hikrobot_mpsdk_core::RigidTransform> path;
   path.reserve(poses.size());
   for (const auto & stamped : poses) {
-    tf2::Quaternion q;
-    tf2::fromMsg(stamped.pose.orientation, q);
-    q.normalize();
-    path.push_back({
-      stamped.pose.position.x, stamped.pose.position.y, stamped.pose.position.z,
-      {q.x(), q.y(), q.z(), q.w()}});
+    hikrobot_mpsdk_core::EulerPose converted;
+    if (!cartesian_pose_to_sdk(stamped, base_frame_, converted, error)) {
+      return false;
+    }
+    path.push_back(hikrobot_mpsdk_core::euler_pose_to_transform(converted));
   }
   return hikrobot_mpsdk_core::cartesian_path_within_limits(
     *current, path, max_cartesian_translation_step_m_, max_cartesian_rotation_step_rad_, error);
@@ -917,6 +1007,188 @@ void HikrobotDriverNode::accept_move_s(const std::shared_ptr<GoalHandleMoveS> go
   });
 }
 
+void HikrobotDriverNode::accept_follow_cartesian_path(
+  const std::shared_ptr<GoalHandleFollowCartesianPath> goal_handle)
+{
+  join_motion_worker();
+  std::shared_ptr<std::atomic_bool> cancel_token;
+  {
+    std::lock_guard<std::mutex> lock(path_cancel_mutex_);
+    cancel_token = path_cancel_token_;
+  }
+  std::lock_guard<std::mutex> lock(worker_mutex_);
+  motion_worker_ = std::thread([this, goal_handle, cancel_token]() {
+    const auto reservation_guard = make_scope_exit([this, cancel_token]() {
+        {
+          std::lock_guard<std::mutex> cancel_lock(path_cancel_mutex_);
+          if (path_cancel_token_ == cancel_token) {
+            path_cancel_token_.reset();
+          }
+        }
+        release_goal_reservation();
+      });
+
+    const auto complete = [goal_handle](
+      const std::shared_ptr<FollowCartesianPath::Result> & result,
+      hikrobot_mpsdk_core::MotionResultCode code)
+      {
+        if (code == hikrobot_mpsdk_core::MotionResultCode::kSuccess) {
+          goal_handle->succeed(result);
+        } else if (code == hikrobot_mpsdk_core::MotionResultCode::kCanceled &&
+          goal_handle->is_canceling())
+        {
+          goal_handle->canceled(result);
+        } else {
+          goal_handle->abort(result);
+        }
+      };
+
+    try {
+      if (!cancel_token) {
+        auto result = std::make_shared<FollowCartesianPath::Result>();
+        result->result_code = FollowCartesianPath::Result::DRIVER_NOT_READY;
+        result->failure_stage = FollowCartesianPath::Result::STAGE_VALIDATION;
+        result->message = "path cancellation state was not initialized";
+        complete(result, hikrobot_mpsdk_core::MotionResultCode::kDriverNotReady);
+        return;
+      }
+      if (cancel_token->load(std::memory_order_acquire)) {
+        auto result = std::make_shared<FollowCartesianPath::Result>();
+        result->result_code = FollowCartesianPath::Result::CANCELED;
+        result->failure_stage = FollowCartesianPath::Result::STAGE_VALIDATION;
+        result->message = "path canceled after acceptance and before worker execution";
+        complete(result, hikrobot_mpsdk_core::MotionResultCode::kCanceled);
+        return;
+      }
+
+      const auto goal = goal_handle->get_goal();
+      hikrobot_mpsdk_core::FollowCartesianPathRequest request;
+      request.targets.reserve(goal->poses.size());
+      for (std::size_t i = 0; i < goal->poses.size(); ++i) {
+        hikrobot_mpsdk_core::EulerPose converted;
+        std::string error;
+        if (!pose_to_sdk(goal->poses[i], converted, error)) {
+          auto result = std::make_shared<FollowCartesianPath::Result>();
+          result->result_code = FollowCartesianPath::Result::INVALID_GOAL;
+          result->failure_stage = FollowCartesianPath::Result::STAGE_VALIDATION;
+          result->failure_target_index_valid = true;
+          result->failure_target_index = static_cast<uint32_t>(i);
+          result->message = error;
+          complete(result, hikrobot_mpsdk_core::MotionResultCode::kInvalidGoal);
+          return;
+        }
+        request.targets.push_back(converted);
+      }
+      request.options = options_from_goal(
+        goal->speed_percent, goal->blend_radius, goal->timeout);
+
+      if (cancel_token->load(std::memory_order_acquire)) {
+        auto result = std::make_shared<FollowCartesianPath::Result>();
+        result->result_code = FollowCartesianPath::Result::CANCELED;
+        result->failure_stage = FollowCartesianPath::Result::STAGE_VALIDATION;
+        result->message = "path canceled before Active Tool refresh";
+        complete(result, hikrobot_mpsdk_core::MotionResultCode::kCanceled);
+        return;
+      }
+
+      int64_t sdk_error = 0;
+      std::string error;
+      if (!prepare_cartesian_goal(
+          goal->poses, request.options, request.tool, sdk_error, error))
+      {
+        auto result = std::make_shared<FollowCartesianPath::Result>();
+        result->result_code = sdk_error == 0 ? FollowCartesianPath::Result::INVALID_GOAL :
+          FollowCartesianPath::Result::SDK_ERROR;
+        result->sdk_error_code = sdk_error;
+        result->failure_stage = FollowCartesianPath::Result::STAGE_VALIDATION;
+        result->message = error;
+        complete(
+          result, sdk_error == 0 ? hikrobot_mpsdk_core::MotionResultCode::kInvalidGoal :
+          hikrobot_mpsdk_core::MotionResultCode::kSdkError);
+        return;
+      }
+      if (cancel_token->load(std::memory_order_acquire)) {
+        auto result = std::make_shared<FollowCartesianPath::Result>();
+        result->result_code = FollowCartesianPath::Result::CANCELED;
+        result->failure_stage = FollowCartesianPath::Result::STAGE_VALIDATION;
+        result->message = "path canceled after validation and before ID reservation";
+        complete(result, hikrobot_mpsdk_core::MotionResultCode::kCanceled);
+        return;
+      }
+
+      const auto core_result = core_->execute_follow_cartesian_path(
+        request,
+        [this, goal_handle](const hikrobot_mpsdk_core::CartesianPathFeedback & source) {
+          auto feedback = std::make_shared<FollowCartesianPath::Feedback>();
+          feedback->stage = static_cast<uint8_t>(source.stage);
+          feedback->total_targets = static_cast<uint32_t>(source.total_targets);
+          feedback->queued_targets = static_cast<uint32_t>(source.queued_targets);
+          feedback->current_segment_valid = source.current_segment_valid;
+          feedback->current_segment_index = static_cast<uint32_t>(source.current_segment_index);
+          feedback->current_path_id = source.current_path_id;
+          feedback->actual_tcp_valid = source.actual_tcp_valid;
+          if (source.actual_tcp_valid) {
+            feedback->actual_tcp.header.stamp = now();
+            feedback->actual_tcp.header.frame_id = base_frame_;
+            feedback->actual_tcp.pose = transform_to_ros(source.actual_tcp);
+          }
+          feedback->final_position_error_m = source.final_position_error_mm / 1000.0;
+          feedback->final_orientation_error_rad =
+            source.final_orientation_error_deg * kDegToRad;
+          feedback->motion_callback_sequence = source.motion_callback_sequence;
+          feedback->motion_callback_post_start = source.motion_callback_post_start;
+          feedback->motion_callback_valid = source.motion_callback_valid;
+          feedback->motion_callback_path_id = source.motion_callback_path_id;
+          feedback->motion_callback_previous_target_id =
+            source.motion_callback_previous_target_id;
+          feedback->motion_callback_next_target_id = source.motion_callback_next_target_id;
+          feedback->motion_callback_stopped = source.motion_callback_stopped;
+          feedback->motion_callback_left_path_count = source.motion_callback_left_path_count;
+          feedback->motion_callback_age_ms = source.motion_callback_age_ms;
+          feedback->motion_callback_path_matches = source.motion_callback_path_matches;
+          feedback->observed_running_queue_evidence = source.observed_running_queue_evidence;
+          feedback->observed_terminal_queue_evidence = source.observed_terminal_queue_evidence;
+          feedback->final_in_tolerance = source.final_in_tolerance;
+          feedback->har_motion_status = source.har_motion_status;
+          feedback->har_sample_sequence = source.har_sample_sequence;
+          feedback->new_har_sample = source.new_har_sample;
+          feedback->stable_sample_count = source.stable_sample_count;
+          feedback->required_stable_samples = source.required_stable_samples;
+          feedback->completion_blocker = source.completion_blocker;
+          feedback->diagnostic_summary = source.diagnostic_summary;
+          if (!source.diagnostic_summary.empty()) {
+            RCLCPP_INFO(
+              get_logger(), "FollowCartesianPath %s", source.diagnostic_summary.c_str());
+          }
+          goal_handle->publish_feedback(feedback);
+        }, cancel_token.get());
+
+      auto result = std::make_shared<FollowCartesianPath::Result>();
+      result->result_code = map_result_code(core_result.code);
+      result->sdk_error_code = core_result.sdk_error;
+      result->path_ids = core_result.path_ids;
+      result->failure_stage = static_cast<uint8_t>(core_result.failure_stage);
+      result->failure_target_index_valid = core_result.failure_target_index_valid;
+      result->failure_target_index = static_cast<uint32_t>(core_result.failure_target_index);
+      result->execution_time = duration_from_ms(core_result.execution_time);
+      result->message = core_result.message;
+      complete(result, core_result.code);
+    } catch (const std::exception & error) {
+      auto result = std::make_shared<FollowCartesianPath::Result>();
+      result->result_code = FollowCartesianPath::Result::SDK_ERROR;
+      result->failure_stage = FollowCartesianPath::Result::STAGE_NONE;
+      result->message = std::string("FollowCartesianPath worker exception: ") + error.what();
+      complete(result, hikrobot_mpsdk_core::MotionResultCode::kSdkError);
+    } catch (...) {
+      auto result = std::make_shared<FollowCartesianPath::Result>();
+      result->result_code = FollowCartesianPath::Result::SDK_ERROR;
+      result->failure_stage = FollowCartesianPath::Result::STAGE_NONE;
+      result->message = "FollowCartesianPath worker caught an unknown exception";
+      complete(result, hikrobot_mpsdk_core::MotionResultCode::kSdkError);
+    }
+  });
+}
+
 void HikrobotDriverNode::publish_state()
 {
   if (!ros_active_.load(std::memory_order_acquire) || !core_) {
@@ -964,7 +1236,7 @@ void HikrobotDriverNode::publish_state()
 
   hikrobot_msgs::msg::RobotStatus status;
   status.header.stamp = stamp;
-  status.connected = core_->configured();
+  status.connected = core_->connected();
   status.active = core_->active();
   status.state_valid = state.valid;
   status.state_stale = state.stale;
@@ -986,7 +1258,13 @@ void HikrobotDriverNode::publish_state()
   diagnostic_msgs::msg::DiagnosticStatus diag;
   diag.name = "hikrobot_driver";
   diag.hardware_id = get_parameter("robot_ip").as_string();
-  if (!state.valid || state.stale) {
+  if (core_->command_recovery_required()) {
+    diag.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+    diag.message = "SDK command channel recovery required; restart Driver process";
+  } else if (!status.connected) {
+    diag.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+    diag.message = "SDK command channel disconnected";
+  } else if (!state.valid || state.stale) {
     diag.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
     diag.message = "HAR state stale/unavailable";
   } else if (state.emergency_status != 0 || state.servo_status == 2) {
