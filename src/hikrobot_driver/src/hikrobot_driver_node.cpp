@@ -1,5 +1,6 @@
 #include "hikrobot_driver/hikrobot_driver_node.hpp"
 #include "hikrobot_driver/cartesian_contract.hpp"
+#include "hikrobot_mpsdk_core/command_channel_health.hpp"
 #include "hikrobot_mpsdk_core/legacy_movel_queue_executor.hpp"
 
 #include <algorithm>
@@ -104,7 +105,9 @@ void HikrobotDriverNode::declare_parameters()
   declare_parameter<int>("stop_confirmation_timeout_ms", 3000);
   declare_parameter<int>("sdk_command_lock_timeout_ms", 1000);
   declare_parameter<int>("sdk_command_watchdog_ms", 3000);
-  declare_parameter<std::string>("arc_output_name", "start");
+  declare_parameter<bool>("health_monitor.enabled", true);
+  declare_parameter<int>("health_monitor.check_period_ms", 1000);
+  declare_parameter<int>("health_monitor.communication_timeout_ms", 3000);
   declare_parameter<int>("tool_id", 0);
   declare_parameter<int>("workpiece_id", -1);
   declare_parameter<double>("max_cartesian_translation_step_m", 0.05);
@@ -115,6 +118,7 @@ void HikrobotDriverNode::declare_parameters()
 void HikrobotDriverNode::create_ros_interfaces()
 {
   state_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  health_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   sdk_service_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
   stop_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
 
@@ -128,6 +132,11 @@ void HikrobotDriverNode::create_ros_interfaces()
   state_timer_ = create_wall_timer(
     std::chrono::milliseconds(static_cast<int>(1000.0 / hz)),
     std::bind(&HikrobotDriverNode::publish_state, this), state_callback_group_);
+  health_monitor_check_period_ms_ =
+    std::max(1, static_cast<int>(get_parameter("health_monitor.check_period_ms").as_int()));
+  health_timer_ = create_wall_timer(
+    std::chrono::milliseconds(health_monitor_check_period_ms_),
+    std::bind(&HikrobotDriverNode::monitor_health, this), health_callback_group_);
 
   const auto base = get_node_base_interface();
   const auto clock = get_node_clock_interface();
@@ -174,6 +183,12 @@ void HikrobotDriverNode::create_ros_interfaces()
       const std::shared_ptr<hikrobot_msgs::srv::SetDigitalOutput::Request> req,
       std::shared_ptr<hikrobot_msgs::srv::SetDigitalOutput::Response> res)
     {
+      if (core_->command_recovery_required()) {
+        res->success = false;
+        res->sdk_error_code = hikrobot_mpsdk_core::kLocalSdkRecoveryRequired;
+        res->message = "SDK command-channel recovery is required; restart the Driver process";
+        return;
+      }
       if (!ros_active_.load() || !core_->active()) {
         res->success = false;
         res->message = "driver must be ACTIVE and command-connected for DO writes";
@@ -285,20 +300,40 @@ HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_configure(const rclcpp
   stop_confirmation_timeout_ms_ = get_parameter("stop_confirmation_timeout_ms").as_int();
   sdk_command_lock_timeout_ms_ = get_parameter("sdk_command_lock_timeout_ms").as_int();
   sdk_command_watchdog_ms_ = get_parameter("sdk_command_watchdog_ms").as_int();
-  arc_output_name_ = get_parameter("arc_output_name").as_string();
+  health_monitor_enabled_ = get_parameter("health_monitor.enabled").as_bool();
+  health_monitor_check_period_ms_ =
+    static_cast<int>(get_parameter("health_monitor.check_period_ms").as_int());
+  health_monitor_communication_timeout_ms_ =
+    get_parameter("health_monitor.communication_timeout_ms").as_int();
   tool_id_ = get_parameter("tool_id").as_int();
   workpiece_id_ = get_parameter("workpiece_id").as_int();
   max_cartesian_translation_step_m_ = get_parameter("max_cartesian_translation_step_m").as_double();
   max_cartesian_rotation_step_rad_ = get_parameter("max_cartesian_rotation_step_rad").as_double();
   if (max_cartesian_translation_step_m_ <= 0.0 || max_cartesian_rotation_step_rad_ <= 0.0 ||
     stop_confirmation_timeout_ms_ <= 0 || sdk_command_lock_timeout_ms_ <= 0 ||
-    sdk_command_watchdog_ms_ <= sdk_command_lock_timeout_ms_ || arc_output_name_.empty())
+    sdk_command_watchdog_ms_ <= sdk_command_lock_timeout_ms_ ||
+    health_monitor_check_period_ms_ <= 0 || health_monitor_communication_timeout_ms_ <= 0)
   {
     RCLCPP_ERROR(
       get_logger(),
-      "Cartesian/stop limits must be positive and SDK lock timeout must be less than watchdog");
+      "Cartesian/stop/health limits must be positive and SDK lock timeout must be less than watchdog");
     return CallbackReturn::FAILURE;
   }
+  const int har_publish_ms = get_parameter("har_publish_ms").as_int();
+  if (health_monitor_enabled_ &&
+    (har_publish_ms <= 0 ||
+    health_monitor_communication_timeout_ms_ < 3 * health_monitor_check_period_ms_ ||
+    health_monitor_communication_timeout_ms_ < 10 * har_publish_ms))
+  {
+    RCLCPP_ERROR(
+      get_logger(),
+      "health_monitor.communication_timeout_ms must be at least 3 check periods and 10 HAR periods");
+    return CallbackReturn::FAILURE;
+  }
+  health_timer_->cancel();
+  health_timer_ = create_wall_timer(
+    std::chrono::milliseconds(health_monitor_check_period_ms_),
+    std::bind(&HikrobotDriverNode::monitor_health, this), health_callback_group_);
 
   std::string sequence_file = get_parameter("sequence_state_file").as_string();
   if (sequence_file.empty()) {
@@ -310,10 +345,9 @@ HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_configure(const rclcpp
   hikrobot_mpsdk_core::RuntimeConfig cfg;
   cfg.robot_ip = get_parameter("robot_ip").as_string();
   cfg.robot_port = get_parameter("robot_port").as_int();
-  cfg.har_publish_ms = static_cast<uint32_t>(get_parameter("har_publish_ms").as_int());
+  cfg.har_publish_ms = static_cast<uint32_t>(har_publish_ms);
   cfg.sdk_command_lock_timeout_ms = sdk_command_lock_timeout_ms_;
   cfg.sdk_command_watchdog_ms = sdk_command_watchdog_ms_;
-  cfg.arc_output_name = arc_output_name_;
   cfg.sequence_state_file = sequence_file;
   cfg.sequence_collision_retries = get_parameter("sequence_collision_retries").as_int();
 
@@ -321,6 +355,11 @@ HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_configure(const rclcpp
   if (!core_->configure(cfg, error)) {
     RCLCPP_ERROR(get_logger(), "Core configure failed: %s", error.c_str());
     return CallbackReturn::FAILURE;
+  }
+  RCLCPP_INFO(get_logger(), "Hikrobot SDK connected");
+  {
+    std::lock_guard<std::mutex> lock(health_monitor_mutex_);
+    health_transition_tracker_.reset();
   }
   if (!refresh_active_tool_cache(error)) {
     RCLCPP_ERROR(get_logger(), "Active Tool load during configure failed: %s", error.c_str());
@@ -398,6 +437,10 @@ HikrobotDriverNode::CallbackReturn HikrobotDriverNode::on_cleanup(const rclcpp_l
   request_motion_cancel();
   join_motion_worker();
   core_->cleanup();
+  {
+    std::lock_guard<std::mutex> lock(health_monitor_mutex_);
+    health_transition_tracker_.reset();
+  }
   clear_active_tool_cache();
   goal_reserved_.store(false);
   return CallbackReturn::SUCCESS;
@@ -1267,7 +1310,7 @@ void HikrobotDriverNode::publish_state()
   } else if (!state.valid || state.stale) {
     diag.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
     diag.message = "HAR state stale/unavailable";
-  } else if (state.emergency_status != 0 || state.servo_status == 2) {
+  } else if (state.emergency_status == 1 || state.servo_status == 2) {
     diag.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
     diag.message = "robot safety/servo error state";
   } else {
@@ -1276,6 +1319,68 @@ void HikrobotDriverNode::publish_state()
   }
   array.status.push_back(diag);
   diagnostics_pub_->publish(array);
+}
+
+void HikrobotDriverNode::monitor_health()
+{
+  if (!health_monitor_enabled_ || !core_) {
+    return;
+  }
+
+  const auto snapshot = core_->monitor_health(
+    std::chrono::milliseconds(health_monitor_communication_timeout_ms_));
+  std::vector<HealthEvent> events;
+  {
+    std::lock_guard<std::mutex> lock(health_monitor_mutex_);
+    events = health_transition_tracker_.update(snapshot);
+  }
+
+  for (const auto event : events) {
+    switch (event) {
+      case HealthEvent::kMonitorStarted:
+        RCLCPP_INFO(get_logger(), "Health monitor started");
+        break;
+      case HealthEvent::kCommunicationHealthy:
+        RCLCPP_INFO(get_logger(), "Robot communication healthy");
+        break;
+      case HealthEvent::kSdkDisconnected:
+        RCLCPP_ERROR(get_logger(), "Hikrobot controller communication lost");
+        break;
+      case HealthEvent::kSdkReconnected:
+        RCLCPP_WARN(
+          get_logger(),
+          "SDK connection callback reports connected again; recovery lock remains until process restart");
+        break;
+      case HealthEvent::kHarTimedOut:
+        RCLCPP_ERROR(
+          get_logger(), "HAR robot-state feedback timed out after %ld ms",
+          static_cast<long>(snapshot.har_age.count()));
+        break;
+      case HealthEvent::kHarRestored:
+        RCLCPP_WARN(
+          get_logger(), "HAR robot-state feedback resumed; recovery lock remains if already set");
+        break;
+      case HealthEvent::kEmergencyActivated:
+        RCLCPP_ERROR(get_logger(), "Hikrobot emergency stop activated");
+        RCLCPP_ERROR(get_logger(), "Robot motion unavailable");
+        break;
+      case HealthEvent::kEmergencyReleased:
+        RCLCPP_INFO(get_logger(), "Hikrobot emergency stop released");
+        break;
+      case HealthEvent::kCommandTimedOut:
+        RCLCPP_ERROR(
+          get_logger(), "Hikrobot SDK command timeout; operation=%s elapsed_ms=%ld",
+          snapshot.active_operation.c_str(), static_cast<long>(snapshot.sdk_call_elapsed.count()));
+        RCLCPP_ERROR(get_logger(), "Command channel marked unhealthy");
+        break;
+      case HealthEvent::kRecoveryRequired:
+        RCLCPP_ERROR(
+          get_logger(), "SDK command channel unavailable: %s",
+          snapshot.fault_message.c_str());
+        RCLCPP_ERROR(get_logger(), "Recovery required");
+        break;
+    }
+  }
 }
 
 }  // namespace hikrobot_driver

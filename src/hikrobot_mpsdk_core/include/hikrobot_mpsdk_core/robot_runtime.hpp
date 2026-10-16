@@ -18,9 +18,27 @@ struct RuntimeConfig
   uint32_t har_publish_ms{50};
   int sdk_command_lock_timeout_ms{1000};
   int sdk_command_watchdog_ms{3000};
-  std::string arc_output_name{"start"};
   std::string sequence_state_file{"/tmp/hikrobot_path_id.state"};
   int sequence_collision_retries{3};
+};
+
+struct RuntimeHealthSnapshot
+{
+  bool monitoring_active{false};
+  bool sdk_connected{false};
+  bool command_connected{false};
+  bool recovery_required{false};
+  bool sdk_call_in_progress{false};
+  std::chrono::milliseconds sdk_call_elapsed{0};
+  int64_t fault_code{0};
+  std::string fault_message;
+  std::string active_operation;
+  bool har_received{false};
+  uint64_t har_sequence{0};
+  std::chrono::milliseconds har_age{0};
+  bool har_timed_out{false};
+  int emergency_status{0};
+  bool emergency_active{false};
 };
 
 class RobotRuntime
@@ -42,6 +60,7 @@ public:
   bool active() const;
   bool busy() const;
   bool command_recovery_required() const;
+  RuntimeHealthSnapshot monitor_health(std::chrono::milliseconds communication_timeout);
 
   RobotState robot_state() const;
   MotionState motion_state() const;

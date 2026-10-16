@@ -358,20 +358,50 @@ and holds the initial TCP orientation. It is not a collision planner, continuous
 - **[Pending]** Eye-in-Hand absolute accuracy needs physical metrology, multi-pose repeatability,
   and synchronized image/robot sampling.
 
+## IO simplification and passive Health Monitor (2026-10-15, uncommitted)
+
+The historical welding failure is now attributed to external high-frequency arc interference
+restarting the controller, not to evidence that a high DO makes Legacy GetDO intrinsically unsafe.
+The protected `start` state machine, `arc_output_name`, cached UNKNOWN/LOW/ASSERTED state,
+high-level read suppression, `-10004`, and arc mutex were removed. GetDI/GetDO now each call
+`MP_GetConfigIOLevelStatus` once, and SetDO calls `MP_SetConfigIOLevelStatus` once with no implicit
+Get, retry, or cached-state comparison. All names, including `start`, share this behavior.
+
+A passive Driver Health Monitor now samples only memory state: connection callback, periodic HAR
+cache, `CommandChannelHealth`, watchdog/recovery state, and the official emergency enum. Defaults
+are enabled, 1000 ms checks, and a 3000 ms HAR timeout. It runs after configure in ACTIVE and
+INACTIVE, stops before cleanup, never calls the vendor SDK or waits for the SDK command mutex, and
+logs only state transitions. Only `E_MP_EMERGENCY_ACTIVE` (official value 1) is treated as asserted;
+emergency blocks motion without being mislabeled as disconnect. Confirmed HAR timeout while the SDK
+still reports connected permanently locks command recovery, as do disconnect and command timeout.
+
+Cleanup now checks recovery before SDK teardown and again after deactivate. A possibly in-use handle
+is not unsubscribed, disconnected, or destroyed after an uncertain SDK outcome. Removing the arc
+mutex also removes the known path where watchdog/disconnect handling waited behind a blocked arc IO
+call.
+
+This remains offline-only work. No controller, Driver, lifecycle transition, motion, IO, or PathID
+state access was performed.
+
+### Bounded IO executor (2026-10-16, uncommitted)
+
+The second step is implemented as one Runtime-owned worker for only GetDI/GetDO/SetDO. Service
+requests are copied into owning tasks with QUEUED/RUNNING/COMPLETED/CANCELLED states. The worker
+shares the existing Handle and `sdk_mutex`; it changes QUEUED to RUNNING atomically only after the
+mutex and recovery checks, immediately before the Legacy call. A queue/lock timeout cancels the task
+and returns `-10001`, so it cannot execute late. A RUNNING timeout returns `-10002` with UNKNOWN
+physical outcome, poisons CommandChannelHealth and the executor, cancels queued tasks, and makes new
+IO requests return `-10003`. Late SDK success cannot clear recovery or restart queued work.
+
+Defaults give an approximately 4000 ms Service budget: 1000 ms queue/mutex admission plus 3000 ms
+in-SDK watchdog. Cleanup pauses submissions, cancels non-running work, and waits one watchdog period
+for idleness. It never destroys a Handle still possibly used by the worker. The worker is joined on
+normal destruction and is never detached. If the vendor call is permanently blocked, safe object
+lifetime and bounded process exit cannot both be achieved with the SDK API: Runtime destruction will
+wait. Operational recovery therefore requires an external supervisor to allow a bounded graceful
+shutdown and then terminate/replace the whole process. The Driver does not automatically kill itself.
+
 ## Next entry point: IO HIL
-
-### Protected arc DO command-channel repair (2026-09-11)
-
-The `start` DO is protected by the `arc_output_name` parameter (default
-`start`) and an UNKNOWN/LOW/ASSERTED software state. The safe sequence is
-`pre-read low -> set high -> no Get while high -> set low` (optional post-low
-read). While ASSERTED, Get returns a local suppression error and cached
-commanded `true`; it is not a hardware readback. The state mutex is held across
-the Legacy SDK call, so a Get cannot pass a concurrent successful high write,
-and a direct low write is not preceded or followed by Get. Watchdog detection
-does not cancel a vendor synchronous call. This change has only been built and
-tested offline; no controller, Driver, motion, IO, or real welding HIL was
-performed. Hardware isolation and physical shutoff remain necessary.
 
 Do not start by changing CMake or SDK discovery: the implemented path is already in
 `RobotRuntime::{set_digital_output,get_digital_output,get_digital_input}` and the three ROS Services.

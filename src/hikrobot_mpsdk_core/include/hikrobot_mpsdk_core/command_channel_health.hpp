@@ -11,7 +11,6 @@ namespace hikrobot_mpsdk_core
 constexpr int64_t kLocalSdkCommandBusy = -10001;
 constexpr int64_t kLocalSdkCommandTimeout = -10002;
 constexpr int64_t kLocalSdkRecoveryRequired = -10003;
-constexpr int64_t kLocalProtectedOutputReadSuppressed = -10004;
 
 bool is_sdk_transport_error(int64_t code);
 
@@ -32,6 +31,9 @@ public:
   void mark_configured_connected();
   void mark_clean_disconnected();
   void on_connection_status(bool connected);
+  void mark_feedback_timeout(std::chrono::milliseconds age);
+  void mark_call_timeout(
+    const std::string & operation, std::chrono::milliseconds watchdog_timeout);
   void begin_call(const std::string & operation, std::chrono::steady_clock::time_point now);
   void end_call(
     int64_t sdk_result, const std::string & operation,

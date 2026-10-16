@@ -11,7 +11,8 @@ add_library(
     src/motion_sequence_manager.cpp
     src/legacy_movel_queue_executor.cpp
     src/command_channel_health.cpp
-    src/protected_arc_output.cpp
+    src/io_command_executor.cpp
+    src/legacy_io_dispatch.cpp
     src/tool_transform.cpp
 )
 
@@ -90,8 +91,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_tool_transform hikrobot_mpsdk_core_logic)
   ament_add_gtest(test_command_channel_health tests/test_command_channel_health.cpp)
   target_link_libraries(test_command_channel_health hikrobot_mpsdk_core_logic)
-  ament_add_gtest(test_protected_arc_output tests/test_protected_arc_output.cpp)
-  target_link_libraries(test_protected_arc_output hikrobot_mpsdk_core_logic)
+  ament_add_gtest(test_legacy_io_dispatch tests/test_legacy_io_dispatch.cpp)
+  target_link_libraries(test_legacy_io_dispatch hikrobot_mpsdk_core_logic)
+  ament_add_gtest(test_io_command_executor tests/test_io_command_executor.cpp)
+  target_link_libraries(test_io_command_executor hikrobot_mpsdk_core_logic)
   ament_add_gtest(
     test_legacy_movel_queue_executor
     tests/test_legacy_movel_queue_executor.cpp

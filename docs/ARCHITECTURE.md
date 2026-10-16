@@ -42,6 +42,70 @@
 2. disconnect
 3. destroy SDK handle
 
+If command outcome is already unknown/recovery-required, cleanup stops before
+issuing further SDK calls or destroying the possibly in-use handle. The passive
+health-monitor window is disabled before cleanup begins.
+
+## Runtime health monitoring
+
+After configure succeeds, `RobotRuntime` exposes a memory-only snapshot of the
+SDK connection callback, periodic HAR cache (sequence, age, emergency status),
+and `CommandChannelHealth`. A dedicated low-rate Driver timer consumes this
+snapshot in both ACTIVE and configured INACTIVE states. It never takes the SDK
+command mutex and never invokes a vendor API, so a blocked SDK call cannot stop
+watchdog polling or transition logging.
+
+The default 3000 ms HAR threshold is sixty times the default 50 ms publication
+period. A timeout is considered a communication fault only while monitoring is
+active and the SDK connection callback still reports connected; it then sets
+the existing permanent recovery lock and rejects new SDK commands. Disconnect,
+HAR timeout, command timeout, and emergency stop remain distinct states.
+Cleanup disables monitoring before unsubscribe/deactivate work, preventing
+expected lifecycle transitions from being classified as lost feedback.
+
+The SDK emergency enum is evaluated explicitly: only
+`E_MP_EMERGENCY_ACTIVE` makes motion unavailable. It does not change the raw SDK
+connection state and does not itself create command-channel recovery.
+
+## IO execution
+
+DI and DO reads use one Legacy `MP_GetConfigIOLevelStatus` call; DO writes use
+one Legacy `MP_SetConfigIOLevelStatus` call. Every signal name, including
+`start`, follows the same path. There is no protected-output cache, welding
+state machine, read suppression, automatic readback, or retry. The existing
+single handle, timed SDK mutex, lifecycle/write permissions, watchdog, and
+recovery lock remain shared with motion and Tool operations.
+
+Callers check recovery both before waiting for the command mutex and again
+after acquiring it. Therefore a request that was already waiting when another
+call timed out cannot execute later after the poisoned call returns.
+
+### Bounded IO Service executor
+
+Only the three DI/DO Services use `IoCommandExecutor`. One Runtime-owned worker
+consumes owning tasks serially; motion, Tool, lifecycle, and IO calls still use
+the same SDK Handle and `sdk_mutex`. The worker does not mark a task RUNNING
+when it dequeues it. It first acquires the SDK mutex and rechecks recovery, then
+atomically changes QUEUED to RUNNING immediately before entering the Legacy IO
+API. A Service-side queue timeout can therefore change QUEUED to CANCELLED, and
+the worker must skip the SDK call even if the mutex becomes available later.
+
+Once RUNNING, timeout cannot cancel the vendor call. The Service returns
+`-10002`, the executor stops accepting work, queued tasks become CANCELLED, and
+`CommandChannelHealth` becomes permanently recovery-required. The existing
+health timer remains independent and may observe the same timeout concurrently;
+both paths are idempotent. A late return retires the task but cannot clear the
+fault or run queued work.
+
+Cleanup first pauses the IO executor, cancels tasks that have not entered the
+SDK, and waits at most the watchdog period for worker idleness. If an in-flight
+call remains, cleanup marks recovery and preserves the Handle. The executor is
+declared after the Runtime state it uses, so normal destruction joins it before
+those objects are destroyed. There is deliberately no detached thread. Because
+the SDK provides no cancellation primitive, a permanently blocked call also
+makes the final worker join/process shutdown unbounded; external process-level
+termination is the only safe final escalation.
+
 ## Motion execution
 
 The core serializes all motion commands. MoveJ, MoveL, MoveC and MoveS share the same executor and differ only in SDK parameter construction and completion criteria.

@@ -32,6 +32,7 @@
 #include "hikrobot_msgs/srv/get_active_tool.hpp"
 #include "hikrobot_msgs/srv/get_tool_info_list.hpp"
 #include "hikrobot_mpsdk_core/robot_runtime.hpp"
+#include "hikrobot_driver/health_monitor.hpp"
 
 namespace hikrobot_driver
 {
@@ -65,6 +66,7 @@ private:
   void declare_parameters();
   void create_ros_interfaces();
   void publish_state();
+  void monitor_health();
   void join_motion_worker();
   void release_goal_reservation();
 
@@ -136,7 +138,9 @@ private:
   int stop_confirmation_timeout_ms_{3000};
   int sdk_command_lock_timeout_ms_{1000};
   int sdk_command_watchdog_ms_{3000};
-  std::string arc_output_name_{"start"};
+  bool health_monitor_enabled_{true};
+  int health_monitor_check_period_ms_{1000};
+  int health_monitor_communication_timeout_ms_{3000};
   int tool_id_{0};
   int workpiece_id_{-1};
   double max_cartesian_translation_step_m_{0.05};
@@ -148,9 +152,13 @@ private:
   rclcpp_lifecycle::LifecyclePublisher<hikrobot_msgs::msg::RobotStatus>::SharedPtr status_pub_;
   rclcpp_lifecycle::LifecyclePublisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_pub_;
   rclcpp::TimerBase::SharedPtr state_timer_;
+  rclcpp::TimerBase::SharedPtr health_timer_;
   rclcpp::CallbackGroup::SharedPtr state_callback_group_;
+  rclcpp::CallbackGroup::SharedPtr health_callback_group_;
   rclcpp::CallbackGroup::SharedPtr sdk_service_callback_group_;
   rclcpp::CallbackGroup::SharedPtr stop_callback_group_;
+  std::mutex health_monitor_mutex_;
+  HealthTransitionTracker health_transition_tracker_;
 
   rclcpp_action::Server<MoveJ>::SharedPtr move_j_server_;
   rclcpp_action::Server<MoveL>::SharedPtr move_l_server_;

@@ -62,18 +62,72 @@ No TF is published, and camera/hand-eye transforms are not part of V0.2-03.
 - `/hikrobot_driver/get_digital_output`
 - `/hikrobot_driver/get_digital_input`
 
-`arc_output_name` (default `start`) identifies the protected welding arc DO. Its
-sequence is `pre-read low -> set high -> no Get while high -> set low` (an
-optional post-low read is operator-controlled). While asserted, Get returns a
-local failure with the cached commanded value and never performs hardware
-readback; this is not physical confirmation. SDK synchronous calls remain
-watchdog-monitored but cannot be cancelled, so hardware isolation and a
-physical shutoff remain required.
+All DI/DO names use the same Legacy IO path. GetDI and GetDO each issue one
+`MP_GetConfigIOLevelStatus` call; SetDO issues one
+`MP_SetConfigIOLevelStatus` call and performs no implicit readback, retry, or
+state correction. In particular, `GetDO("start")` is an ordinary hardware read;
+there is no cached welding-output state or high-level suppression. A successful
+Set response confirms only that the SDK Set call returned success; an immediate
+readback may still reflect controller update latency.
+
+Read services require a configured, command-connected Runtime but do not require
+the ACTIVE lifecycle state. SetDO retains the ACTIVE and control-readiness
+contract. All calls share the single SDK handle and command mutex.
 - `/hikrobot_driver/stop_motion`
 - `/hikrobot_driver/get_active_tool`
 - `/hikrobot_driver/get_tool_info_list`
 
 `stop_motion` is a normal software motion stop. It is **not** a safety-rated emergency stop.
+
+## Health monitor
+
+The Driver has a passive runtime monitor with these defaults:
+
+```yaml
+health_monitor:
+  enabled: true
+  check_period_ms: 1000
+  communication_timeout_ms: 3000
+```
+
+It reads the SDK connection callback state, cached periodic HAR robot status,
+the command watchdog, recovery lock, and the official emergency enum. It does
+not call the SDK, ping the controller, create another handle, or wait for the
+SDK command mutex. Monitoring begins only after configure has completed,
+continues while INACTIVE, and stops before cleanup starts. A HAR timeout while
+the SDK still reports connected locks the command channel as recovery-required;
+brief gaps below the configured timeout do not. Recovery is never cleared by a
+late callback or apparent reconnect.
+
+The official SDK defines `E_MP_EMERGENCY_INACTIVE=0` and
+`E_MP_EMERGENCY_ACTIVE=1`; only the latter is logged as an asserted emergency
+stop. Emergency stop makes motion unavailable but is not reported as an SDK
+disconnect. Logs are emitted on transitions rather than every monitor tick.
+
+The three IO Services submit owning tasks to one managed serial worker rather
+than calling the vendor SDK on the ROS callback thread. A task has
+QUEUED/RUNNING/COMPLETED/CANCELLED states. QUEUED covers waiting behind another
+IO request and waiting for the shared SDK mutex; only the atomic transition
+immediately before the Legacy API call makes it RUNNING.
+
+With the defaults, a Service waits at most 1000 ms to enter the SDK and then at
+most 3000 ms for the synchronous call, for an approximately 4000 ms worst-case
+budget (plus normal scheduler latency):
+
+- `-10001`: the task did not enter the SDK before the queue/lock deadline and
+  was canceled; it cannot execute later;
+- `-10002`: the task entered the SDK but did not return before the watchdog;
+  the physical outcome is unknown;
+- `-10003`: the executor/command channel is unavailable or recovery-required,
+  so no SDK call was attempted.
+
+An execution timeout poisons `CommandChannelHealth`, rejects/cancels later IO
+tasks, and does not create another worker or SDK handle. A late SDK return cannot
+clear recovery. The vendor function itself remains uncancellable; if it never
+returns, Runtime destruction safely waits rather than detaching the worker or
+destroying its Handle. Consequently explicit process shutdown may also remain
+blocked and an external supervisor must use bounded graceful shutdown followed
+by process-level termination when replacement is required.
 
 FollowCartesianPath uses `MP_ClearMotionTarget`, one `MP_AddMovlTarget` per point, and one
 `MP_StartRealTimeMotion`. A complete `2 * point_count` PathID block is persisted before the first

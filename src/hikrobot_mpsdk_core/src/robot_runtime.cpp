@@ -1,7 +1,8 @@
 #include "hikrobot_mpsdk_core/robot_runtime.hpp"
 #include "hikrobot_mpsdk_core/command_channel_health.hpp"
+#include "hikrobot_mpsdk_core/io_command_executor.hpp"
+#include "hikrobot_mpsdk_core/legacy_io_dispatch.hpp"
 #include "hikrobot_mpsdk_core/legacy_movel_queue_executor.hpp"
-#include "hikrobot_mpsdk_core/protected_arc_output.hpp"
 
 #include <algorithm>
 #include <array>
@@ -51,6 +52,20 @@ std::string sdk_call_failure_message(const std::string & operation, int64_t code
     return operation + " rejected because SDK command-channel recovery is required; restart the Driver process";
   }
   return operation + " failed: " + hex_error(code);
+}
+
+void normalize_io_failure(IoResult & result, const std::string & operation)
+{
+  if (result.sdk_error == kLocalSdkCommandBusy) {
+    result.message =
+      "IO command timed out before entering the vendor SDK; task was cancelled/not executed";
+  } else if (result.sdk_error == kLocalSdkCommandTimeout) {
+    result.message = "SDK command timeout; outcome unknown";
+  } else if (result.sdk_error == kLocalSdkRecoveryRequired) {
+    result.message = "SDK command-channel recovery is required; restart the Driver process";
+  } else {
+    result.message = sdk_call_failure_message(operation, result.sdk_error);
+  }
 }
 
 bool cartesian_target_reached(
@@ -168,9 +183,9 @@ struct RobotRuntime::Impl : LegacyMoveLQueueBackend
   };
 
   RuntimeConfig config{};
-  mutable ProtectedArcOutputState arc_output_state{};
   MP_HANDLE handle{0};
   mutable std::atomic_bool connected{false};
+  std::atomic_bool health_monitoring{false};
   bool subscribed{false};
   std::atomic_bool configured{false};
   mutable std::atomic_bool active{false};
@@ -202,6 +217,9 @@ struct RobotRuntime::Impl : LegacyMoveLQueueBackend
   mutable std::atomic<int64_t> last_sdk_error{0};
   mutable std::mutex error_mutex;
   mutable std::string last_error_message;
+  // Declared last so its destructor joins the worker before any SDK/health
+  // state referenced by an in-flight task is destroyed.
+  mutable IoCommandExecutor io_executor;
 
   static void robot_status_callback(ST_COMMON_CALLBACK_DATA * data)
   {
@@ -252,7 +270,6 @@ struct RobotRuntime::Impl : LegacyMoveLQueueBackend
     if (self->configured.load(std::memory_order_acquire)) {
       self->command_health.on_connection_status(is_connected);
       if (!is_connected) {
-        self->arc_output_state.reset_unknown();
         self->active.store(false, std::memory_order_release);
         self->motion_recovery_required.store(true, std::memory_order_release);
         self->set_error(
@@ -268,8 +285,6 @@ struct RobotRuntime::Impl : LegacyMoveLQueueBackend
       std::chrono::steady_clock::now(),
       std::chrono::milliseconds(config.sdk_command_watchdog_ms));
     if (snapshot.recovery_required) {
-      arc_output_state.reset_unknown();
-      connected.store(false, std::memory_order_release);
       active.store(false, std::memory_order_release);
       motion_recovery_required.store(true, std::memory_order_release);
       set_error(snapshot.fault_code, snapshot.fault_message);
@@ -279,7 +294,8 @@ struct RobotRuntime::Impl : LegacyMoveLQueueBackend
 
   int64_t call(
     const std::function<int64_t()> & fn,
-    const std::string & operation = "SDK command")
+    const std::string & operation = "SDK command",
+    const IoCommandExecutor::StartCallback & mark_io_running = {})
   {
     if (configured.load(std::memory_order_acquire)) {
       const auto health = refresh_command_health();
@@ -300,17 +316,32 @@ struct RobotRuntime::Impl : LegacyMoveLQueueBackend
       return kLocalSdkCommandBusy;
     }
 
+    // Health may have become poisoned while this caller waited for the SDK
+    // mutex. Recheck after acquiring it so an already-queued caller cannot run
+    // after a watchdog timeout or disconnect was reported.
+    if (configured.load(std::memory_order_acquire)) {
+      const auto health = refresh_command_health();
+      if (health.recovery_required) {
+        return kLocalSdkRecoveryRequired;
+      }
+    }
+
+    if (mark_io_running && !mark_io_running()) {
+      return kLocalSdkCommandBusy;
+    }
+
     const bool monitor_health = configured.load(std::memory_order_acquire);
     if (monitor_health) {
       command_health.begin_call(operation, std::chrono::steady_clock::now());
     }
     const int64_t ret = fn();
+    CommandChannelSnapshot completed_health;
     if (monitor_health) {
       command_health.end_call(ret, operation, std::chrono::steady_clock::now());
+      completed_health = refresh_command_health();
     }
-    last_sdk_error.store(ret, std::memory_order_release);
-    if (configured.load(std::memory_order_acquire) && is_sdk_transport_error(ret)) {
-      (void)refresh_command_health();
+    if (!monitor_health || !completed_health.recovery_required) {
+      last_sdk_error.store(ret, std::memory_order_release);
     }
     return ret;
   }
@@ -504,13 +535,29 @@ struct RobotRuntime::Impl : LegacyMoveLQueueBackend
 
   void cleanup_internal()
   {
-    arc_output_state.reset_unknown();
-    deactivate_internal();
+    health_monitoring.store(false, std::memory_order_release);
+    const auto io_wait = std::chrono::milliseconds(config.sdk_command_watchdog_ms);
+    if (!io_executor.pause_and_wait_idle(io_wait)) {
+      command_health.mark_call_timeout("IO command during cleanup", io_wait);
+      (void)refresh_command_health();
+    }
 
     if (command_health.snapshot().recovery_required) {
       // A timed-out SDK call may still be executing with this handle. Destroying or
       // reusing it would introduce a use-after-free/race inside the vendor SDK.
       // Keep the process permanently poisoned and require process replacement.
+      configured.store(false, std::memory_order_release);
+      connected.store(false, std::memory_order_release);
+      active.store(false, std::memory_order_release);
+      current_path_id.store(0, std::memory_order_release);
+      return;
+    }
+
+    deactivate_internal();
+
+    if (command_health.snapshot().recovery_required) {
+      // Do not continue unsubscribe/disconnect/destroy after a lifecycle SDK
+      // operation makes the handle outcome uncertain.
       configured.store(false, std::memory_order_release);
       connected.store(false, std::memory_order_release);
       active.store(false, std::memory_order_release);
@@ -773,7 +820,6 @@ bool RobotRuntime::configure(const RuntimeConfig & config, std::string & error)
   }
   impl_->cleanup_internal();
   impl_->config = config;
-  impl_->arc_output_state.reset_unknown();
   if (config.sdk_command_lock_timeout_ms <= 0 || config.sdk_command_watchdog_ms <= 0 ||
     config.sdk_command_watchdog_ms <= config.sdk_command_lock_timeout_ms)
   {
@@ -874,6 +920,8 @@ bool RobotRuntime::configure(const RuntimeConfig & config, std::string & error)
   }
   impl_->configured = true;
   impl_->command_health.mark_configured_connected();
+  impl_->health_monitoring.store(true, std::memory_order_release);
+  impl_->io_executor.resume();
   impl_->set_error(E_MP_SUCCESS, "");
   return true;
 }
@@ -1058,7 +1106,9 @@ bool RobotRuntime::connected() const
 
 bool RobotRuntime::active() const
 {
-  return impl_->active.load(std::memory_order_acquire) && connected();
+  const auto state = impl_->robot_state_snapshot(std::chrono::milliseconds(1000));
+  const bool emergency_active = state.valid && state.emergency_status == E_MP_EMERGENCY_ACTIVE;
+  return impl_->active.load(std::memory_order_acquire) && connected() && !emergency_active;
 }
 
 bool RobotRuntime::busy() const {return impl_->motion_busy.load(std::memory_order_acquire);}
@@ -1066,6 +1116,48 @@ bool RobotRuntime::busy() const {return impl_->motion_busy.load(std::memory_orde
 bool RobotRuntime::command_recovery_required() const
 {
   return impl_->refresh_command_health().recovery_required;
+}
+
+RuntimeHealthSnapshot RobotRuntime::monitor_health(
+  std::chrono::milliseconds communication_timeout)
+{
+  RuntimeHealthSnapshot out;
+  out.monitoring_active = impl_->health_monitoring.load(std::memory_order_acquire) &&
+    impl_->configured.load(std::memory_order_acquire);
+  out.sdk_connected = impl_->connected.load(std::memory_order_acquire);
+
+  auto command = impl_->refresh_command_health();
+  const auto now = std::chrono::steady_clock::now();
+  {
+    std::lock_guard<std::mutex> lock(impl_->robot_cache.mutex);
+    out.har_received = impl_->robot_cache.received;
+    out.har_sequence = impl_->robot_cache.sequence;
+    if (out.har_received) {
+      out.har_age = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - impl_->robot_cache.received_at);
+      out.emergency_status = static_cast<int>(impl_->robot_cache.status.eEmergencyStatus);
+    }
+  }
+
+  // The official enum defines ACTIVE as exactly 1. Unknown enum values are not
+  // silently promoted to an emergency-stop assertion.
+  out.emergency_active = out.har_received &&
+    out.emergency_status == static_cast<int>(E_MP_EMERGENCY_ACTIVE);
+  out.har_timed_out = out.monitoring_active && out.sdk_connected && out.har_received &&
+    communication_timeout.count() > 0 && out.har_age >= communication_timeout;
+  if (out.har_timed_out && !command.recovery_required) {
+    impl_->command_health.mark_feedback_timeout(out.har_age);
+    command = impl_->refresh_command_health();
+  }
+
+  out.command_connected = command.connected;
+  out.recovery_required = command.recovery_required;
+  out.sdk_call_in_progress = command.call_in_progress;
+  out.sdk_call_elapsed = command.call_elapsed;
+  out.fault_code = command.fault_code;
+  out.fault_message = command.fault_message;
+  out.active_operation = command.active_operation;
+  return out;
 }
 
 RobotState RobotRuntime::robot_state() const
@@ -1297,8 +1389,8 @@ IoResult RobotRuntime::set_digital_output(const std::string & name, bool value)
   IoResult out;
   const auto health = impl_->refresh_command_health();
   if (health.recovery_required) {
-    out.sdk_error = health.fault_code == 0 ? kLocalSdkRecoveryRequired : health.fault_code;
-    out.message = health.fault_message;
+    out.sdk_error = kLocalSdkRecoveryRequired;
+    out.message = "SDK command-channel recovery is required; restart the Driver process";
     return out;
   }
   if (!impl_->configured || !health.connected || impl_->handle == 0) {
@@ -1307,31 +1399,41 @@ IoResult RobotRuntime::set_digital_output(const std::string & name, bool value)
     return out;
   }
 
-  const bool protected_output = name == impl_->config.arc_output_name;
-  std::unique_lock<std::mutex> arc_lock;
-  if (protected_output) {
-    arc_lock = impl_->arc_output_state.lock();
-  }
-
-  ST_IO_LEVEL_INFO info{};
-  std::strncpy(info.stIOLevelAttr.szIOName, name.c_str(), sizeof(info.stIOLevelAttr.szIOName) - 1);
-  info.stIOLevelAttr.eCommonType = E_MP_IO_DO;
-  info.stIOLevelValue.nValue = value ? 1 : 0;
-  const int64_t ret = impl_->call([this, &info]() {
-    return MP_SetConfigIOLevelStatus(impl_->handle, &info);
-  }, "MP_SetConfigIOLevelStatus(DO)");
-  out.success = ret == E_MP_SUCCESS;
-  out.value = value;
-  out.sdk_error = ret;
-  out.message = out.success ? "ok" : sdk_call_failure_message("MP_SetConfigIOLevelStatus", ret);
-  if (protected_output) {
-    impl_->arc_output_state.write_result_locked(value, out.success);
-  }
+  auto * impl = impl_.get();
+  const std::string operation = "MP_SetConfigIOLevelStatus(DO)";
+  out = impl->io_executor.execute(
+    [impl, name, value, operation](const IoCommandExecutor::StartCallback & mark_running) {
+      return dispatch_digital_set(
+        name, value,
+        [impl, operation, mark_running](const std::string & io_name, bool io_value) {
+          ST_IO_LEVEL_INFO info{};
+          std::strncpy(
+            info.stIOLevelAttr.szIOName, io_name.c_str(),
+            sizeof(info.stIOLevelAttr.szIOName) - 1);
+          info.stIOLevelAttr.eCommonType = E_MP_IO_DO;
+          info.stIOLevelValue.nValue = io_value ? 1 : 0;
+          return impl->call([impl, &info]() {
+            return MP_SetConfigIOLevelStatus(impl->handle, &info);
+          }, operation, mark_running);
+        });
+    },
+    std::chrono::milliseconds(impl->config.sdk_command_lock_timeout_ms),
+    std::chrono::milliseconds(impl->config.sdk_command_watchdog_ms),
+    [impl, operation]() {
+      const auto timeout = std::chrono::milliseconds(impl->config.sdk_command_watchdog_ms);
+      impl->command_health.mark_call_timeout(operation, timeout);
+      (void)impl->refresh_command_health();
+    });
   if (!out.success) {
+    normalize_io_failure(out, "MP_SetConfigIOLevelStatus");
+    if (out.sdk_error == kLocalSdkCommandTimeout) {
+      impl_->set_error(out.sdk_error, out.message);
+      return out;
+    }
     const auto after = impl_->refresh_command_health();
     if (after.recovery_required && !after.fault_message.empty()) {
-      out.sdk_error = after.fault_code;
-      out.message = after.fault_message;
+      out.sdk_error = kLocalSdkRecoveryRequired;
+      out.message = "SDK command-channel recovery is required; restart the Driver process";
     }
     impl_->set_error(out.sdk_error, out.message);
   }
@@ -1343,8 +1445,8 @@ IoResult RobotRuntime::get_digital_output(const std::string & name) const
   IoResult out;
   const auto health = impl_->refresh_command_health();
   if (health.recovery_required) {
-    out.sdk_error = health.fault_code == 0 ? kLocalSdkRecoveryRequired : health.fault_code;
-    out.message = health.fault_message;
+    out.sdk_error = kLocalSdkRecoveryRequired;
+    out.message = "SDK command-channel recovery is required; restart the Driver process";
     return out;
   }
   if (!impl_->configured || !health.connected || impl_->handle == 0) {
@@ -1353,44 +1455,44 @@ IoResult RobotRuntime::get_digital_output(const std::string & name) const
     return out;
   }
 
-  const bool protected_output = name == impl_->config.arc_output_name;
-  std::unique_lock<std::mutex> arc_lock;
-  if (protected_output) {
-    arc_lock = impl_->arc_output_state.lock();
-    if (impl_->arc_output_state.state_locked() == ProtectedOutputState::ASSERTED) {
-      out.value = true;
-      out.sdk_error = kLocalProtectedOutputReadSuppressed;
-      out.message =
-        "hardware readback suppressed while protected arc output is asserted; "
-        "cached commanded state=true";
+  auto * impl = impl_.get();
+  const std::string operation = "MP_GetConfigIOLevelStatus(DO)";
+  out = impl->io_executor.execute(
+    [impl, name, operation](const IoCommandExecutor::StartCallback & mark_running) {
+      return dispatch_digital_get(
+        name, DigitalIoType::kOutput,
+        [impl, operation, mark_running](
+          const std::string & io_name, DigitalIoType, bool & io_value)
+        {
+          ST_IO_LEVEL_ATTR attr{};
+          std::strncpy(attr.szIOName, io_name.c_str(), sizeof(attr.szIOName) - 1);
+          attr.stIOSignalType.eType = E_MP_COMMON_IO_TYPE;
+          attr.stIOSignalType.unionDetailType.eCommonType = E_MP_IO_DO;
+          ST_IO_LEVEL_VALUE value{};
+          const int64_t ret = impl->call([impl, &attr, &value]() {
+            return MP_GetConfigIOLevelStatus(impl->handle, &attr, &value);
+          }, operation, mark_running);
+          io_value = value.nValue != 0;
+          return ret;
+        });
+    },
+    std::chrono::milliseconds(impl->config.sdk_command_lock_timeout_ms),
+    std::chrono::milliseconds(impl->config.sdk_command_watchdog_ms),
+    [impl, operation]() {
+      const auto timeout = std::chrono::milliseconds(impl->config.sdk_command_watchdog_ms);
+      impl->command_health.mark_call_timeout(operation, timeout);
+      (void)impl->refresh_command_health();
+    });
+  if (!out.success) {
+    normalize_io_failure(out, "MP_GetConfigIOLevelStatus(DO)");
+    if (out.sdk_error == kLocalSdkCommandTimeout) {
+      impl_->set_error(out.sdk_error, out.message);
       return out;
     }
-  }
-
-  ST_IO_LEVEL_ATTR attr{};
-  std::strncpy(attr.szIOName, name.c_str(), sizeof(attr.szIOName) - 1);
-  attr.stIOSignalType.eType = E_MP_COMMON_IO_TYPE;
-  attr.stIOSignalType.unionDetailType.eCommonType = E_MP_IO_DO;
-  ST_IO_LEVEL_VALUE value{};
-  const int64_t ret = impl_->call([this, &attr, &value]() {
-    return MP_GetConfigIOLevelStatus(impl_->handle, &attr, &value);
-  }, "MP_GetConfigIOLevelStatus(DO)");
-  out.success = ret == E_MP_SUCCESS;
-  out.value = value.nValue != 0;
-  out.sdk_error = ret;
-  out.message = out.success ? "ok" : sdk_call_failure_message("MP_GetConfigIOLevelStatus(DO)", ret);
-  if (protected_output) {
-    if (out.success) {
-      impl_->arc_output_state.read_result_locked(out.value);
-    } else {
-      impl_->arc_output_state.mark_unknown_locked();
-    }
-  }
-  if (!out.success) {
     const auto after = impl_->refresh_command_health();
     if (after.recovery_required && !after.fault_message.empty()) {
-      out.sdk_error = after.fault_code;
-      out.message = after.fault_message;
+      out.sdk_error = kLocalSdkRecoveryRequired;
+      out.message = "SDK command-channel recovery is required; restart the Driver process";
     }
     impl_->set_error(out.sdk_error, out.message);
   }
@@ -1402,8 +1504,8 @@ IoResult RobotRuntime::get_digital_input(const std::string & name) const
   IoResult out;
   const auto health = impl_->refresh_command_health();
   if (health.recovery_required) {
-    out.sdk_error = health.fault_code == 0 ? kLocalSdkRecoveryRequired : health.fault_code;
-    out.message = health.fault_message;
+    out.sdk_error = kLocalSdkRecoveryRequired;
+    out.message = "SDK command-channel recovery is required; restart the Driver process";
     return out;
   }
   if (!impl_->configured || !health.connected || impl_->handle == 0) {
@@ -1412,23 +1514,44 @@ IoResult RobotRuntime::get_digital_input(const std::string & name) const
     return out;
   }
 
-  ST_IO_LEVEL_ATTR attr{};
-  std::strncpy(attr.szIOName, name.c_str(), sizeof(attr.szIOName) - 1);
-  attr.stIOSignalType.eType = E_MP_COMMON_IO_TYPE;
-  attr.stIOSignalType.unionDetailType.eCommonType = E_MP_IO_DI;
-  ST_IO_LEVEL_VALUE value{};
-  const int64_t ret = impl_->call([this, &attr, &value]() {
-    return MP_GetConfigIOLevelStatus(impl_->handle, &attr, &value);
-  }, "MP_GetConfigIOLevelStatus(DI)");
-  out.success = ret == E_MP_SUCCESS;
-  out.value = value.nValue != 0;
-  out.sdk_error = ret;
-  out.message = out.success ? "ok" : sdk_call_failure_message("MP_GetConfigIOLevelStatus(DI)", ret);
+  auto * impl = impl_.get();
+  const std::string operation = "MP_GetConfigIOLevelStatus(DI)";
+  out = impl->io_executor.execute(
+    [impl, name, operation](const IoCommandExecutor::StartCallback & mark_running) {
+      return dispatch_digital_get(
+        name, DigitalIoType::kInput,
+        [impl, operation, mark_running](
+          const std::string & io_name, DigitalIoType, bool & io_value)
+        {
+          ST_IO_LEVEL_ATTR attr{};
+          std::strncpy(attr.szIOName, io_name.c_str(), sizeof(attr.szIOName) - 1);
+          attr.stIOSignalType.eType = E_MP_COMMON_IO_TYPE;
+          attr.stIOSignalType.unionDetailType.eCommonType = E_MP_IO_DI;
+          ST_IO_LEVEL_VALUE value{};
+          const int64_t ret = impl->call([impl, &attr, &value]() {
+            return MP_GetConfigIOLevelStatus(impl->handle, &attr, &value);
+          }, operation, mark_running);
+          io_value = value.nValue != 0;
+          return ret;
+        });
+    },
+    std::chrono::milliseconds(impl->config.sdk_command_lock_timeout_ms),
+    std::chrono::milliseconds(impl->config.sdk_command_watchdog_ms),
+    [impl, operation]() {
+      const auto timeout = std::chrono::milliseconds(impl->config.sdk_command_watchdog_ms);
+      impl->command_health.mark_call_timeout(operation, timeout);
+      (void)impl->refresh_command_health();
+    });
   if (!out.success) {
+    normalize_io_failure(out, "MP_GetConfigIOLevelStatus(DI)");
+    if (out.sdk_error == kLocalSdkCommandTimeout) {
+      impl_->set_error(out.sdk_error, out.message);
+      return out;
+    }
     const auto after = impl_->refresh_command_health();
     if (after.recovery_required && !after.fault_message.empty()) {
-      out.sdk_error = after.fault_code;
-      out.message = after.fault_message;
+      out.sdk_error = kLocalSdkRecoveryRequired;
+      out.message = "SDK command-channel recovery is required; restart the Driver process";
     }
     impl_->set_error(out.sdk_error, out.message);
   }

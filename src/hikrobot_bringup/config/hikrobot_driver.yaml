@@ -3,13 +3,17 @@ hikrobot_driver:
     robot_ip: "192.168.2.64"
     robot_port: 9000
     har_publish_ms: 50
-    # SDK public IO calls are synchronous/blocking and expose no per-call timeout.
-    # Lock contention returns quickly; a longer in-flight call poisons the command
-    # channel and requires Driver process replacement because its outcome is unknown.
+    # IO Services wait this long to enter the SDK, then this long after SDK entry.
+    # The single IO worker returns the Service on timeout, but cannot cancel a
+    # vendor call already blocked inside the SDK.
     sdk_command_lock_timeout_ms: 1000
     sdk_command_watchdog_ms: 3000
-    # Protected welding arc DO. Hardware readback is suppressed while asserted.
-    arc_output_name: "start"
+    # Purely passive runtime health monitoring: connection callback, HAR cache,
+    # and command-channel watchdog. It never calls the vendor SDK.
+    health_monitor:
+      enabled: true
+      check_period_ms: 1000
+      communication_timeout_ms: 3000
 
     joint_names: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
     base_frame: "base_link"

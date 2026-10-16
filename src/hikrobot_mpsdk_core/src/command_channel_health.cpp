@@ -64,6 +64,37 @@ void CommandChannelHealth::on_connection_status(bool connected)
   }
 }
 
+void CommandChannelHealth::mark_feedback_timeout(std::chrono::milliseconds age)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (recovery_required_) {
+    return;
+  }
+  connected_ = false;
+  recovery_required_ = true;
+  fault_code_ = kLocalSdkRecoveryRequired;
+  std::ostringstream message;
+  message << "HAR robot-state feedback absent for " << age.count() <<
+    " ms; controller communication is unhealthy and the Driver process must be restarted";
+  fault_message_ = message.str();
+}
+
+void CommandChannelHealth::mark_call_timeout(
+  const std::string & operation, std::chrono::milliseconds watchdog_timeout)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!call_in_progress_ || recovery_required_) {
+    return;
+  }
+  connected_ = false;
+  recovery_required_ = true;
+  fault_code_ = kLocalSdkCommandTimeout;
+  std::ostringstream message;
+  message << operation << " exceeded the " << watchdog_timeout.count()
+          << " ms SDK command watchdog; outcome is unknown and the Driver process must be restarted";
+  fault_message_ = message.str();
+}
+
 void CommandChannelHealth::begin_call(
   const std::string & operation, std::chrono::steady_clock::time_point now)
 {

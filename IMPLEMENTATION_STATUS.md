@@ -29,6 +29,16 @@
   PathID-block reservation, bounded pre-Start collision retry, and conservative completion
 - independent 3000 ms FollowCartesianPath stop-confirmation deadline, sequence-based Motion/HAR
   freshness, and raw completion-blocker diagnostics
+- unified Legacy DI/DO access: one Get per read and one Set per write, including `start`, with no
+  welding-specific cached state, read suppression, implicit readback, or retry
+- passive runtime Health Monitor using the SDK connection callback, periodic HAR cache,
+  command watchdog, recovery lock, and explicit official emergency enum; default 1000 ms check /
+  3000 ms communication timeout, active while configured (including lifecycle INACTIVE)
+- transition-only terminal health logging for disconnect, HAR timeout, command timeout,
+  recovery-required, emergency activation/release, and healthy communication
+- one managed serial `IoCommandExecutor` for the three IO Services, with owning
+  QUEUED/RUNNING/COMPLETED/CANCELLED tasks, atomic pre-SDK start, bounded Service waits,
+  cancellation-before-start, and permanent recovery after an in-flight timeout
 
 ## Verification completed
 
@@ -50,14 +60,14 @@ The Ubuntu 22.04 + ROS 2 Humble development machine completed a full workspace b
 
 ## Pending or deferred
 
-- IO/DO HIL is deferred.
-
-The protected welding output (`arc_output_name`, default `start`) now tracks
-UNKNOWN/LOW/ASSERTED. A successful high write publishes ASSERTED and a
-successful low write publishes LOW; failures, disconnect, cleanup, and command
-watchdog recovery publish UNKNOWN. Hardware DO readback is suppressed while
-ASSERTED to prevent blocking the SDK command channel. This is source-level and
-offline-test work only; no real arc HIL has been rerun.
+- IO/DO HIL is deferred. Hardware interference was identified as the cause of the historical
+  controller restart; the former protected-arc software state machine has been removed. The
+  simplified uniform Legacy IO path and Health Monitor have offline coverage only.
+- Vendor IO APIs remain synchronous and uncancellable, but the ROS Service callback now returns
+  within queue timeout plus execution watchdog (default approximately 4000 ms). A permanently
+  blocked worker safely retains the Handle and prevents new commands; final process destruction
+  cannot be bounded without unsafe detach/cancellation and therefore requires external supervisor
+  escalation after a graceful-shutdown budget.
 - MoveC and MoveS have software tests but no physical HIL.
 - The complete automated visual three-point route and MoveL speed 3%/5% are not verified.
 - FollowCartesianPath has software implementation and offline tests, but no controller HIL yet.

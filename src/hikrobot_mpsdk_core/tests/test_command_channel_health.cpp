@@ -81,5 +81,51 @@ TEST(CommandChannelHealthTest, CleanDisconnectDoesNotCreateRecoveryRequirement)
   EXPECT_FALSE(state.recovery_required);
 }
 
+TEST(CommandChannelHealthTest, FeedbackTimeoutRequiresRecovery)
+{
+  CommandChannelHealth health;
+  health.mark_configured_connected();
+  health.mark_feedback_timeout(3001ms);
+
+  const auto state = health.snapshot();
+  EXPECT_FALSE(state.connected);
+  EXPECT_TRUE(state.recovery_required);
+  EXPECT_EQ(state.fault_code, kLocalSdkRecoveryRequired);
+  EXPECT_NE(state.fault_message.find("HAR robot-state feedback"), std::string::npos);
+}
+
+TEST(CommandChannelHealthTest, FeedbackTimeoutDoesNotReplaceEarlierCommandTimeout)
+{
+  CommandChannelHealth health;
+  const auto now = std::chrono::steady_clock::time_point{1000ms};
+  health.mark_configured_connected();
+  health.begin_call("blocked SDK call", now);
+  const auto command_timeout = health.poll(now + 3000ms, 3000ms);
+  health.mark_feedback_timeout(4000ms);
+
+  const auto state = health.snapshot();
+  EXPECT_EQ(state.fault_code, kLocalSdkCommandTimeout);
+  EXPECT_EQ(state.fault_message, command_timeout.fault_message);
+}
+
+TEST(CommandChannelHealthTest, ServiceDeadlineCanPoisonAnInFlightCallDirectly)
+{
+  CommandChannelHealth health;
+  const auto now = std::chrono::steady_clock::time_point{1000ms};
+  health.mark_configured_connected();
+  health.begin_call("FakeBlockingIO", now);
+  health.mark_call_timeout("FakeBlockingIO", 3000ms);
+
+  const auto timed_out = health.snapshot();
+  EXPECT_TRUE(timed_out.recovery_required);
+  EXPECT_TRUE(timed_out.call_in_progress);
+  EXPECT_EQ(timed_out.fault_code, kLocalSdkCommandTimeout);
+
+  health.end_call(0, "FakeBlockingIO", now + 4000ms);
+  const auto late_success = health.snapshot();
+  EXPECT_TRUE(late_success.recovery_required);
+  EXPECT_EQ(late_success.fault_code, kLocalSdkCommandTimeout);
+}
+
 }  // namespace
 }  // namespace hikrobot_mpsdk_core
