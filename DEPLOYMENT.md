@@ -1,6 +1,6 @@
 # 机械臂 Driver 部署指南
 
-本文只部署机械臂相关 ROS 2 包，不构建或修改 `mv3d_rgbd_ros2`、`mv3d_rgbd_ros2_interface`。项目能力、全部ROS API、Lifecycle和已知限制见 [README](README.md)。
+当前GitHub `main` 仅交付机械臂相关ROS 2包，已移除 `mv3d_rgbd_ros2` 和 `mv3d_rgbd_ros2_interface` 两个相机包。此次移除只发布到远端，本地原工作空间的相机文件保留。项目能力、全部ROS API、Lifecycle和已知限制见 [README](README.md)。
 
 目标环境是Ubuntu 22.04、ROS 2 Humble、Linux x86_64。机械臂当前vendor shim使用SDK内的`Libs/Linux/LX64/64`布局，不因此承诺ARM兼容。MPSDK由设备供应商单独提供，本仓库不分发。**SDK可以放在任意可读目录**；下面通过用户输入和CMake参数绑定，不要求`/home/ai/SDK`或`/opt`下某个位置。
 
@@ -52,18 +52,18 @@ python3 tools/quick_deploy.py --dry-run
 
 ## 1. 获取源码与准备环境
 
-在已安装ROS 2 Humble的机器上：
+从GitHub的 **main** 获取当前机械臂版本。以下使用新的目录 `hikrobot_ros2_arm`，名称可以自选；不会覆盖已有工作空间。在已安装ROS 2 Humble的机器上：
 
 ```bash
 source /opt/ros/humble/setup.bash
-# 当前发布内容位于开发分支，默认main可能不是这版代码
-git clone --branch experiment/pathid-exhaustion-fail-safe \
-  https://github.com/zdydd03-rgb/hikrobot_ros2.git
-cd hikrobot_ros2
+# main是当前机械臂发布入口，不再克隆旧开发分支
+git clone --branch main --single-branch \
+  https://github.com/zdydd03-rgb/hikrobot_ros2.git hikrobot_ros2_arm
+cd hikrobot_ros2_arm
 export HIKROBOT_WS="$PWD"
 ```
 
-已有克隆则直接进入其根目录并设置`HIKROBOT_WS="$PWD"`，不需要重复clone或切换分支。
+已有旧工作空间且需要保留本地相机包时，不要在该目录切换/同步到已删相机的main；按上面的命令另建一个机械臂工作空间。已有本版本机械臂克隆时，进入其根目录设置`HIKROBOT_WS="$PWD"`即可。原开发分支保留历史版本，当前部署以main为准。
 
 安装编译工具与机械臂ROS依赖（由操作者执行）：
 
@@ -155,7 +155,7 @@ colcon build --packages-up-to hikrobot_bringup \
   "-DHIKROBOT_MPSDK_ROOT=$HIKROBOT_MPSDK_ROOT"
 ```
 
-预期构建5包：`hikrobot_mpsdk_vendor`、`hikrobot_msgs`、`hikrobot_mpsdk_core`、`hikrobot_driver`、`hikrobot_bringup`。`hikrobot_description`是独立模型占位，不在bringup依赖链；需要注册该空包时可额外构建它。不要把无包选择的全工作空间`colcon build`误当成机械臂专用命令，它会选择两个相机包并要求另外的相机SDK。
+预期构建5包：`hikrobot_mpsdk_vendor`、`hikrobot_msgs`、`hikrobot_mpsdk_core`、`hikrobot_driver`、`hikrobot_bringup`。`hikrobot_description`是独立模型占位，不在bringup依赖链；需要注册该空包时可额外构建它。当前main不含相机包；若使用仍含相机的旧本地工作空间，继续保留上述包选择，避免全工作空间构建要求相机SDK。
 
 SDK变量作用与优先级：
 
@@ -330,7 +330,7 @@ g++ -std=c++17 -Wall -Wextra -Wpedantic tools/tool_readonly_probe.cpp \
 | cannot find PUBLIC_COMPAT / wrong ELF class | 检查文件及symlink、x86_64/64位架构和SDK版本 |
 | 二级SDK `.so` not found | 完整库目录保留；source本次install；为当前进程配置LD_LIBRARY_PATH |
 | undefined symbol | 头/库版本混用或ABI不匹配；检查core `ldd -r`和实际解析路径，不只看文件名 |
-| 相机SDK相关错误 | 是否误用了无包选择的全工作空间构建；本指南仅选择机械臂5包，相机包不在本次范围 |
+| 相机SDK相关错误 | 当前main不含相机包；检查是否仍在构建旧本地工作空间，并使用本指南的机械臂包选择 |
 | 找不到参数文件 | Launch从安装share取默认；自定义文件传绝对config_file，并使用正确节点key |
 | Configure没有首帧 | 实际IP/端口、网络、控制器状态、HAR；首帧等待3s不约束Vendor连接调用本身 |
 | 控制权申请失败 | 检查示教器控制权及控制器状态；历史曾有`0x82178005`，不臆造通用错误含义 |
@@ -348,7 +348,7 @@ g++ -std=c++17 -Wall -Wextra -Wpedantic tools/tool_readonly_probe.cpp \
 - 新构建运行7个有效CTest目标、97个GTest，零失败/错误。
 - 安装后的core和Driver均解析到所选SDK；core `ldd -r`无缺库或未解析符号。
 - 只构造安装后的Launch描述，确认默认YAML来自安装share，未执行LaunchService或启动节点。
-- 两个相机包与本轮开始的HEAD逐文件比较完全一致；不属于本次构建验收范围。
+- 上述10月24日部署核验未修改本地相机包；后续main发布已在独立副本中删除远端版本的两个相机包，本地原文件保留。
 - 文档相对链接、Bash代码块语法、Launch Python语法及`git diff --check`通过。
 
 沙箱内colcon曾停在CMake已完成的配置阶段，非沙箱重跑构建/测试正常；这是本轮工具执行

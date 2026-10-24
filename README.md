@@ -52,7 +52,7 @@ ROS 2 Application / CLI
 | `hikrobot_bringup` | Launch 与参数 YAML |
 | `hikrobot_description` | 机器人模型占位；尚无真实 URDF、尺寸、关节极限或网格 |
 
-工作空间另有 `mv3d_rgbd_ros2`、`mv3d_rgbd_ros2_interface` 两个独立相机包，**不在本次修改和机械臂部署范围内**；机械臂构建命令不会选择它们。
+当前GitHub **main仅发布机械臂包**，不再包含 `mv3d_rgbd_ros2`、`mv3d_rgbd_ros2_interface`。远端移除在独立副本中完成，本地原工作空间的相机源码未删除；原开发分支和Git历史仍保留旧版本。获取当前版本请按[部署指南第1节](DEPLOYMENT.md#1-获取源码与准备环境)克隆main到新目录。
 
 运动在一个可 join 的 worker 中执行；三个 IO Service 共用一个 `IoCommandExecutor` worker。两类任务、Tool 与 Lifecycle 都共享同一个 SDK Handle 和 SDK command mutex。HAR/Motion SDK callback 仅更新内存缓存；connection callback 更新连接/健康状态。ROS 主程序使用 MultiThreadedExecutor。
 
