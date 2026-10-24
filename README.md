@@ -3,7 +3,22 @@
 ROS 2 Humble drivers for a Hikrobot HAR robot and Hikrobot RGB-D cameras, using
 the public MPSDK legacy motion API and Mv3dRgbdSDK respectively.
 
-## Verified hardware baseline
+## First driver build: current status (2026-10-24)
+
+- IO HIL succeeded on **2026-10-24**, confirmed by the operator. Per-channel commands,
+  wiring, raw output and the exact test-build revision have not yet been attached.
+- The **11-point Legacy MoveL queue test failed**. This version's documented use is
+  limited to **1..10 points** per `FollowCartesianPath` goal. Do not use more than ten
+  points or claim successful queue refill/long-path continuity.
+- This is a documentation/support boundary: the unchanged source still accepts up to
+  32 points. It does **not** enforce a ten-point runtime rejection; applications must
+  enforce the documented limit. The ten-point scope is not a new independently
+  reviewed HIL PASS for every length from one to ten.
+- See [current verification status](docs/hil/V1_STATUS_2026-10-24.md) and
+  [queue contract](docs/FOLLOW_CARTESIAN_PATH.md). No motion or IO was performed during
+  this documentation update.
+
+## Historical hardware baseline
 
 - Ubuntu 22.04 / ROS 2 Humble target
 - Controller observed in HIL tests: `V2.1.2_1444184_20241223`
@@ -12,10 +27,12 @@ the public MPSDK legacy motion API and Mv3dRgbdSDK respectively.
 - Motion API family: `MP_Motion_API.h` (legacy realtime motion API)
 - HIL verified: connection, HAR state, activation, MoveJ, Cancel/StopMotion, PathID persistence,
   collision recovery, flange/Tool/TCP semantics, Tool queries, and Base-frame Active-Tool TCP MoveL
-- Base Cartesian MoveC/MoveS are implemented and software-tested but still pending physical HIL;
-  IO/DO HIL is deferred
+- Base Cartesian MoveC/MoveS are implemented and software-tested but still pending documented physical HIL;
+  IO HIL succeeded per the operator on 2026-10-24 (see the current status above)
 - A request-specific visual Base-point segmented MoveL route has been checked through D7; dynamic
-  visual transforms, timestamp-synchronized flange history, and `FollowCartesianPath` are not implemented
+  visual transforms and timestamp-synchronized flange history are not implemented.
+  `FollowCartesianPath` is implemented; documented use is restricted to 1..10 points after the
+  failed 11-point HIL test
 
 ## ROS packages
 
@@ -76,7 +93,7 @@ export HIKROBOT_MPSDK_ROOT=/path/to/MPSDK_PUBLIC_FULL_V2.4.0_Build20251106_SVN16
 # Before the first colcon build, exporting it explicitly is useful for direct tests:
 export LD_LIBRARY_PATH="$HIKROBOT_MPSDK_ROOT/Libs/Linux/LX64/64:${LD_LIBRARY_PATH:-}"
 source /opt/ros/humble/setup.bash
-cd ~/hikrobot_ws
+cd ~/hikrobot_ros2
 colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
 ```
 

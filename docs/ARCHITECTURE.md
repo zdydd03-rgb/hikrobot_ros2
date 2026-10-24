@@ -1,5 +1,9 @@
 # Architecture
 
+Current status (2026-10-24): IO HIL succeeded per the operator; eleven-point Legacy MoveL
+queue HIL failed. Documented queue use is **1..10 points**. This is a usage boundary, not a
+new code gate: source still accepts up to 32. See [status/evidence](hil/V1_STATUS_2026-10-24.md).
+
 ## Packages
 
 - `hikrobot_mpsdk_vendor`: exposes the external MPSDK headers and `libMPSDK_PUBLIC_COMPAT.so` as a CMake target.
@@ -7,6 +11,9 @@
 - `hikrobot_mpsdk_core`: ROS-independent C++17 driver core.
 - `hikrobot_driver`: ROS 2 Humble lifecycle node, actions, services, and state publishers.
 - `hikrobot_bringup`: launch and YAML configuration.
+- `hikrobot_description`: placeholder for an exact robot model; no fabricated kinematics.
+- `mv3d_rgbd_ros2`: independent RGB-D camera driver/example nodes.
+- `mv3d_rgbd_ros2_interface`: camera image/point-cloud services.
 
 ## Lifecycle
 
@@ -128,7 +135,8 @@ therefore both TCP, not flange. ROS input/output uses m and normalized quaternio
 use mm and ZYX Euler degrees.
 
 A pre-Add software guard checks current TCP to the first requested point and every adjacent
-MoveC/MoveS segment. Defaults are 0.05 m and 0.1745329252 rad (10 degrees); any violation,
+MoveC/MoveS segment. Node defaults are 0.05 m and 0.1745329252 rad (10 degrees), while
+the current YAML translation setting is 0.600 m despite its 50 mm comment; any violation,
 invalid/stale HAR state, invalid Tool, or Tool-read failure aborts before core execution, so no
 Add API is called and no PathID is consumed. The initial V0.2-03 HIL scope is a current-TCP Base
 Z +10 mm MoveL and return only. Camera/hand-eye input and TF conversion are not implemented.
@@ -144,10 +152,12 @@ The driver therefore:
 - retries only the Add stage when the exact error is `0x82068043`;
 - never automatically repeats a motion after `MP_StartRealTimeMotion` has been attempted successfully, because execution may already have started.
 
-### FollowCartesianPath (software-only)
+### FollowCartesianPath (documented use: 1..10 points)
 
-`follow_cartesian_path` accepts 1..32 ordered `base_frame` Active-Tool TCP poses. The driver
-validates every pose, the timeout and the configured 50 mm/10 degree per-segment guard before
+Current documented use of `follow_cartesian_path` is **1..10** ordered `base_frame` Active-Tool
+TCP poses. Internal validation still permits 32 and has not been changed to reject >10; callers
+must enforce the documented limit. The driver validates every pose, the timeout and the configured
+translation/rotation per-segment guard before
 allocating IDs. The core then reserves and persists two IDs per point, clears the legacy queue,
 adds each `ST_MOTION_MOV_PARAM` with Base coordinate `1:0`, `nToolId` from one Active Tool
  snapshot and `nWorkPieceId=-1`. Controller 2.1.2 HIL observed a ten-entry active Legacy window:
@@ -162,12 +172,14 @@ stop, not success.
 
 Feedback and completion use the same Tool snapshot to compose HAR `^B T_F` into
 `^B T_TCP = ^B T_F × ^F T_Tool`. Completion requires post-Start matching motion-callback queue
-evidence, distinct HAR samples, a stopped terminal callback referencing the final target, and
+evidence, distinct HAR samples, a stopped terminal callback referencing the final target (or the guarded zero/zero sentinel), and
 TCP tolerance. Progress percentage is deliberately not synthesized from time or `dPercent`.
 Cancellation, StopMotion and lifecycle stops are serialized with Start and map to the existing
 Action CANCELED/ABORTED semantics. Start uncertainty or failed queue cleanup blocks subsequent
-motion until lifecycle cleanup. This implementation is not yet validated against controller
-2.1.2 for continuous queue behavior; MoveC/MoveS and online visual correction remain separate.
+motion until lifecycle cleanup. **The eleven-point queue HIL failed on 2026-10-24** per the
+operator. The implemented refill path and its FakeBackend tests do not establish supported
+long-queue continuity; >10 points are excluded from current documented use. MoveC/MoveS and
+online visual correction remain separate verification topics.
 
 ## Units
 

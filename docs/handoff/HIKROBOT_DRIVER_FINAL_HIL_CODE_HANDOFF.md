@@ -1,5 +1,16 @@
 # Hikrobot ROS2 Driver 最终 HIL 代码交接
 
+> **2026-10-24 状态更新，优先于下方 2026-10-16 快照的验收状态：** 用户确认 IO 测试于
+> 2026-10-24 成功；11 点 MoveL 队列测试失败，本版使用说明仅限 **1..10 点**。
+> 源码常量仍是32，文档限制不等于Driver已强制拒绝>10；应用层须限制点数。
+> 20/32点FakeBackend测试是离线实现证据，不是当前支持能力。详细信息及缺失日志见
+> [本版状态](../hil/V1_STATUS_2026-10-24.md)。测试二进制版本未提供，不反推为当前源码版本。
+>
+> 下方Git状态、未提交文件清单、CLI和回归建议保留为10月16日审查快照；其工作区改动已于
+> `ae33fb7d8fa4de0026effaa20a8a9ac9b2dc1ce1` 提交。所有较大队列的示例、1..32描述和
+> 20/32 HIL建议仅作内部实现/历史计划理解，当前实际使用与HIL说明以 **<=10** 为边界。
+> 本次只改文档，不连接硬件、不修改PathID文件；原始接口与源码hash清单保持可追溯。
+
 审查日期：2026-10-16，Asia/Shanghai。工作空间：`/home/ai/hikrobot_ros2`，ROS 2 Humble，Linux x86_64，C++17。
 
 本文依据 **HEAD + 当前全部工作区修改 + 未跟踪源码**。仅新增本 Markdown；没有改源码/配置、运行 Driver、连接控制器、执行运动/IO、读取或修改真实 PathID 状态、切分支、reset、commit 或 push。为遵守“只新增交接 Markdown”，本次没有重新 build/test（会写构建结果），离线结论来自已有日志、CTest 注册和 XML，并核对构建依赖及产物。
@@ -497,7 +508,7 @@ colcon test-result --verbose
 | IO正常 | DI、DO读，高/低Set各一次及显式Get，历史特殊名称高电平可Get；无-10004，无自动Set重试 |
 | IO异常 | 等锁超时未执行、入SDK超时unknown、后续failfast、排队取消与已取出未开始取消、cleanup/析构边界；本地受控假环境先做永久阻塞，不能随意让现场输出失控 |
 | MoveJ/L/C/S | 经复核小目标与返回、单位/Tool/frame/速度/blend、非法输入拒绝、busy，正常Result、Cancel/Stop、超时/stale/急停；普通运动无严格Stop确认需额外核实物理停止 |
-| FollowQueue | 1/10/20/32目标，窗口补充、单Start、全部PathID、running/final证据、zero-target sentinel、HAR独立样本；全程连续性不能只看终点误差 |
+| FollowQueue | 当前使用仅1..10目标；11点HIL已失败，先保留并诊断该失败证据，不扩展20/32。核查单Start、全部PathID、running/final证据、zero-target sentinel、HAR独立样本，不能只看终点误差 |
 | Follow异常 | 接受即Cancel、Add间Cancel、补队列Cancel、Stop抑制Start、underflow、refill错误/碰撞不重播、Stop确认失败Recovery、独立stop窗口 |
 | PathID | 同进程多命令、正常进程重启继续高水位、碰撞有界重试且不回退；耗尽/损坏/持久失败优先在隔离临时文件软件测试，禁止动真文件 |
 | 并发/回归 | IO与运动/Tool争共享mutex、health持续可调度、Lifecycle与服务受控竞争、故障后禁止新动作；不能因运动文件未改跳过 |
@@ -513,7 +524,7 @@ colcon test-result --verbose
 | Tool | `/hikrobot_driver/get_active_tool`、`get_tool_info_list`，请求 `{}` |
 | IO | `get_digital_input`、`get_digital_output` 请求 `{name: 实际配置名}`；`set_digital_output` 另加 `value` |
 | 单次运动 | move_j / move_l / move_c / move_s，类型见第3节，安全Goal文件引用见第12节 |
-| 连续队列 | follow_cartesian_path，1..32 TCP poses，关注完整诊断Feedback |
+| 连续队列 | follow_cartesian_path，本版使用仅1..10 TCP poses；11点HIL失败，源码32点准入尚未收紧 |
 | Stop/Cancel | stop_motion `{}`；`<Action>/_action/cancel_goal`，准确请求见12.4 |
 | 故障定位 | `/rosout`、`/diagnostics`、status last_sdk_error/message、Result failure_stage |
 | 离线入口 | core 5 + driver 2 CTest，97有效GTest；RobotRuntime/ROS集成测试缺失 |

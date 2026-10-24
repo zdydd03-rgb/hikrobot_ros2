@@ -5,7 +5,17 @@ driver. They preserve the controller-observed behavior that establishes a develo
 and distinguish terminal observations from calculations, conclusions, limitations, and work
 that has not yet been verified.
 
-The current report, [`V0.1_to_V0.2-02_HIL_REPORT.md`](V0.1_to_V0.2-02_HIL_REPORT.md), covers the
+## Current first-version status
+
+[2026-10-24 first-version status](V1_STATUS_2026-10-24.md) records the operator-confirmed
+**IO HIL PASS** and **11-point Legacy MoveL queue HIL FAIL**. Documented queue use is limited
+to **1..10 points**; source still permits 32, so this is not a runtime-enforced rejection above ten.
+Raw logs/test-build identity remain to be attached. This status takes precedence over older
+“IO deferred” or “larger queues pending” summaries for the current release boundary.
+
+## Historical reports
+
+The historical report, [`V0.1_to_V0.2-02_HIL_REPORT.md`](V0.1_to_V0.2-02_HIL_REPORT.md), covers the
 V0.1 gate and the V0.2-01, V0.2-02A, and V0.2-02B milestones through read-only ToolManager and
 TCP-pose publication.
 

@@ -1,12 +1,27 @@
-# FollowCartesianPath design and offline verification
+# FollowCartesianPath: first-version usage and implementation
 
-This document describes the first software-only implementation of
+This document describes the current implementation of
 `/hikrobot_driver/follow_cartesian_path`. It is intended for preplanned straight-line
 MoveL queueing; it is not a production planner or the Motion API2 `FollowCartesianPath`.
 
+## Current usage boundary — 2026-10-24
+
+**Use 1..10 targets only in this version. The 11-point HIL test failed**, confirmed by the
+operator on 2026-10-24. More than ten points are excluded from documented usage. IO HIL
+succeeded on the same date; that outcome does not validate the motion queue.
+
+This restriction does not assert that every 1..10-point case has an independently reviewed PASS.
+No complete log or test-build revision was supplied for the failed test; do not infer its cause
+from the historical ten-entry-window observation. See [current evidence](hil/V1_STATUS_2026-10-24.md).
+
+**Runtime/source distinction:** `kMaxFollowCartesianPathTargets` is still 32 and the Action
+still accepts up to that implementation bound. This documentation-only update does not add a
+runtime ten-point rejection. Applications must reject goals with more than ten points. A request
+accepted by the current code is not automatically within this version's supported usage.
+
 ## Contract
 
-The goal contains 1..32 ordered `geometry_msgs/PoseStamped` poses, `speed_percent`, integer
+For current documented use, the goal contains **1..10** ordered `geometry_msgs/PoseStamped` poses, `speed_percent`, integer
 `blend_radius` (0..10), and an optional timeout. Every pose must use the configured
 `base_frame` (`base_link` in the current configuration) and represents the controller Active
 Tool TCP (`^B T_TCP`). No TF conversion, camera transform, tool switching, or online correction
@@ -27,9 +42,10 @@ Active Tool snapshot, reserves and persists two PathIDs per target, then calls:
 Controller 2.1.2 HIL observed a ten-target active Legacy queue window: a 20-target request
 accepted all pre-Start Adds but ran only targets 0 through 9. The Legacy header does not document
 that maximum; API2's documented ten-entry controller queue is corroborating evidence only, not
-this Driver's calling interface. The Action still accepts 1..32 targets, calls Start once, and
+this Driver's calling interface. The implementation calls Start once and
 never clears, restarts, or splits normal execution. Every target retains its preallocated PathID
-and is added once.
+and is added once. For the current 1..10-point usage boundary, no post-Start refill is needed;
+the larger-path refill mechanism remains implemented but is outside the documented usage scope.
 
 The exact pre-Start `0x82068043` collision may retry the complete queue with a new ID block.
 After Start is attempted there is no automatic retry. Partial Add failures clear the queue;
@@ -46,15 +62,18 @@ TCP tolerance, and stable samples from distinct HAR records. Unknown progress is
 unknown; `dPercent` is not converted into a fabricated percentage.
 
 The controller 2.1.2 completion rule remains deliberately strict: the callback must identify the
-final path, report stopped with zero remaining paths, and reference the final target through
-`nPreTargetID` or `nNextTargetID`. TCP tolerance or HAR stopped status alone cannot complete the
+final path and report stopped with zero remaining paths. Final-target evidence may either
+reference the final target through `nPreTargetID` or `nNextTargetID`, or use the implemented
+controller-2.1.2 zero/zero target sentinel, but the sentinel requires an earlier matching running
+callback and a terminal callback newer than the latest running evidence. TCP tolerance or HAR stopped status alone cannot complete the
 Action. The September 2026 single-point HIL physically reached its target but timed out because the
 retained evidence did not include the raw Legacy callback fields needed to explain which strict
-condition remained false. There is currently no evidence to change that compatibility rule.
+condition remained false. The current zero-target compatibility branch is source/offline evidence,
+not proof that the failed 11-point test passed or that its cause is known.
 
 `stop_confirmation_timeout_ms` is independent of the Action timeout and defaults to 3000 ms. A
-timeout/cancel/state failure requests `MP_StopRealTimeMotion`, snapshots the Motion callback
-sequence when that SDK call returns, and waits up to this separate deadline for a newer stopped
+timeout/cancel/state failure snapshots the Motion callback sequence and request time **before**
+requesting `MP_StopRealTimeMotion`, then waits within that separate request-time deadline for a newer stopped
 callback whose PathID belongs to the active queue. An old cached callback or a fresh callback for a
 different PathID cannot confirm the stop. A confirmed stop preserves the original failure stage and
 does not set the recovery lock. Stop SDK failure or confirmation timeout uses `STAGE_STOP`, retains
@@ -91,12 +110,13 @@ refill cancellation, and premature stopped callbacks. No real SDK connection or 
 PathID state is accessed. The companion Cartesian tests cover frame/value conversion and step
 guards.
 
-## HIL still required
+## Current HIL outcome and remaining work
 
-This repair has source and offline-test evidence only; it has not been rerun on the controller.
-The controller 2.1.2 ten-target queue-window observation now has a software refill repair, but
-20/32-target continuity, raw intermediate/final callback semantics, blend-radius behavior and
-timeout/stop confirmation still require HIL.
+The 2026-10-24 **11-point queue test failed**. Keep first-version documented use at **1..10 points**.
+The historical 20-point failure and the FakeBackend 20/32-target tests describe background and
+implementation coverage only; they do not expand this version's usage limit. Raw intermediate/final
+callback semantics, actual failure stage, blend behavior and timeout/stop confirmation need retained
+HIL evidence. Diagnose the eleven-point failure before any proposal to expand the documented limit.
 The next HIL must retain the raw diagnostic snapshots rather than infer callback state from physical
 arrival. MoveC/MoveS HIL, online visual correction, hand-eye integration and welding IO are outside
 this change.

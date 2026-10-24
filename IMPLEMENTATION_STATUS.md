@@ -1,84 +1,71 @@
-# Implementation status — V0.2-03
+# Implementation status — first driver build
 
-## Implemented
+Updated 2026-10-24. Production code baseline: `ae33fb7d8fa4de0026effaa20a8a9ac9b2dc1ce1`.
+This update changes documentation only. Exact HIL binary identity and raw logs were not supplied;
+the date and new hardware outcomes below are operator-confirmed, not reconstructed transcripts.
 
-- ROS 2 Humble package layout
-- external MPSDK vendor target and runtime `LD_LIBRARY_PATH` environment hook
-- ROS-independent `RobotRuntime`
-- exact tested activation chain: control access -> PROGRAMMER -> clear alarms -> motion callback -> MotorOff -> AUTO -> MotorOn -> realtime -> equilibrium mode
-- HAR state cache and stale-state protection
-- persistent `MotionSequenceManager` with persist-before-send semantics
-- bounded automatic recovery for `0x82068043` during the Add stage only
-- shared MotionExecutor path for MoveJ / MoveL / MoveC / MoveS
-- MoveJ rad->deg conversion and joint-CS semantics matching the HIL 05D baseline
-- Cartesian m/quaternion -> mm/ZYX-Euler-degree conversion
-- MoveC via/final mapping from the official SDK structure
-- MoveS via array mapping with the public 49-point limit
-- Action cancellation -> `MP_StopRealTimeMotion`
-- no automatic resend after `MP_StartRealTimeMotion`
-- DO write/read based on the HIL 06D path; DI read from the same public IO API
-- lifecycle driver publishers/services/actions
-- bringup launches an unconfigured lifecycle node; configure and activate are manual operations
-- HIL regression plan
-- lifecycle-aware `/flange_pose` (`^B T_F`) and `/tcp_pose` (`^B T_TCP`) publication
-- read-only controller Active Tool query, cache, and ROS services
-- strict Base-frame Active-Tool TCP contract for MoveL, MoveC, and MoveS
-- per-segment 50 mm / 10 degree Cartesian pre-Add guards
-- TCP-based Cartesian feedback and stable completion using a per-motion Tool snapshot
-- FollowCartesianPath Legacy MoveL queue executor (1..32 points), guarded validation, complete
-  PathID-block reservation, bounded pre-Start collision retry, and conservative completion
-- independent 3000 ms FollowCartesianPath stop-confirmation deadline, sequence-based Motion/HAR
-  freshness, and raw completion-blocker diagnostics
-- unified Legacy DI/DO access: one Get per read and one Set per write, including `start`, with no
-  welding-specific cached state, read suppression, implicit readback, or retry
-- passive runtime Health Monitor using the SDK connection callback, periodic HAR cache,
-  command watchdog, recovery lock, and explicit official emergency enum; default 1000 ms check /
-  3000 ms communication timeout, active while configured (including lifecycle INACTIVE)
-- transition-only terminal health logging for disconnect, HAR timeout, command timeout,
-  recovery-required, emergency activation/release, and healthy communication
-- one managed serial `IoCommandExecutor` for the three IO Services, with owning
-  QUEUED/RUNNING/COMPLETED/CANCELLED tasks, atomic pre-SDK start, bounded Service waits,
-  cancellation-before-start, and permanent recovery after an in-flight timeout
+## Current hardware status
 
-## Verification completed
+- **IO HIL: PASS, operator-confirmed, 2026-10-24.** Detailed DI/DO cases, channel names,
+  wiring, command/results and test-build revision remain to be attached. This does not establish
+  PASS for watchdog, disconnect, permanently blocked SDK calls or every recovery scenario.
+- **11-point Legacy MoveL queue HIL: FAIL, operator-confirmed, 2026-10-24.** Failure stage,
+  final PathID, controller queue count, raw callbacks and final TCP error were not provided.
+  No particular root cause is asserted.
+- **Documented first-version queue use: 1..10 points only.** More than ten points are outside
+  this version's supported usage. Source validation still accepts up to 32; no ten-point runtime
+  gate was implemented in this documentation update. Clients must enforce the usage limit.
+  The scope restriction is not an independently evidenced PASS for all 1..10-point requests.
+- Existing reviewed reports establish historical Lifecycle, MoveJ, Cancel/StopMotion, PathID,
+  Tool/TCP and Base TCP MoveL results for their recorded versions. MoveC/MoveS HIL is not newly
+  established by this status update.
 
-The Ubuntu 22.04 + ROS 2 Humble development machine completed a full workspace build:
+Full evidence boundaries: [2026-10-24 status](docs/hil/V1_STATUS_2026-10-24.md).
 
-- all six ROS 2 packages passed `./scripts/build_humble.sh` / `colcon build`
-- `hikrobot_mpsdk_core` compiled with C++17, `-Wall -Wextra -Wpedantic`
-- core linked successfully against the supplied `libMPSDK_PUBLIC_COMPAT.so`
-- runtime dependency resolution verified for `libMPSDK_ADAPTER.so`, `libMPSDK_LOG.so`, `libMPSDKV212.so`, `libMPSDKV220.so`
-- PathID persistence unit test passed across a simulated process restart
-- launch Python syntax checked
-- all `package.xml` files parsed as XML
-- all six packages were discoverable through the ROS 2 package index
-- `hikrobot_driver_node` started without a robot connection; its Lifecycle, topics,
-  services, and MoveJ/MoveL/MoveC/MoveS action servers were visible in the ROS graph
-- physical HIL passed for Configure/HAR, Activate, MoveJ, Cancel, StopMotion, PathID persistence,
-  sequence-collision recovery, flange/TCP semantics, Tool queries, Base TCP MoveL, invalid-frame
-  rejection, the 50 mm guard, and a request-specific segmented visual MoveL route through D7
+## Implemented in the current source
 
-## Pending or deferred
+- Eight-package workspace: six robot-related packages and two independent RGB-D camera packages.
+- ROS-independent `RobotRuntime`, one Legacy SDK handle and shared SDK command mutex.
+- Manual Lifecycle Configure/Activate/Deactivate/Cleanup; launch does not automatically power on.
+- Legacy MoveJ/MoveL/MoveC/MoveS Actions and cancellation/StopMotion; no automatic replay after Start.
+- Base-frame Active-Tool TCP Cartesian contract; ROS rad/m/quaternion to SDK deg/mm/ZYX Euler.
+- Read-only Tool services, HAR-derived joints/flange and composed TCP publication.
+- Persistent PathID allocation before Add, bounded pre-Start `0x82068043` collision retry,
+  fail-closed sequence exhaustion without wrapping. Keep the live state file intact.
+- FollowCartesianPath Legacy MoveL queue implementation. Internal validation capacity is 32,
+  but current documented usage is **1..10**. Initial window is at most ten; the implemented
+  refill path does not establish successful >10-point HIL and must not be advertised as usable.
+- Callback/HAR sequence diagnostics, distinct HAR completion samples and independent 3000 ms
+  FollowCartesianPath stop-confirmation window.
+- Uniform Legacy DI/DO dispatch through one managed serial IO executor; no protected-arc state,
+  high-output Get suppression, implicit Set readback or automatic Set retry.
+- Passive Health Monitor in ACTIVE and configured INACTIVE, using callbacks/cache and command
+  health; no additional SDK calls or handle. Default check 1000 ms, communication timeout 3000 ms.
 
-- IO/DO HIL is deferred. Hardware interference was identified as the cause of the historical
-  controller restart; the former protected-arc software state machine has been removed. The
-  simplified uniform Legacy IO path and Health Monitor have offline coverage only.
-- Vendor IO APIs remain synchronous and uncancellable, but the ROS Service callback now returns
-  within queue timeout plus execution watchdog (default approximately 4000 ms). A permanently
-  blocked worker safely retains the Handle and prevents new commands; final process destruction
-  cannot be bounded without unsafe detach/cancellation and therefore requires external supervisor
-  escalation after a graceful-shutdown budget.
-- MoveC and MoveS have software tests but no physical HIL.
-- The complete automated visual three-point route and MoveL speed 3%/5% are not verified.
-- FollowCartesianPath has software implementation and offline tests, but no controller HIL yet.
-- Controller 2.1.2 HIL observed that a 20-target Legacy request consumed only its first 10 active
-  queue entries. The core now uses a first-window-10, one-Start, execution-worker refill strategy
-  based on new Motion callback `nLeftPathNum`; every 1..32 target PathID remains preallocated and
-  each target is added once. Continuous 20/32-target HIL remains pending.
-- The stop-deadline repair and completion diagnostics have offline coverage only; the physical
-  single-point arrival did not produce retained raw Legacy callback evidence, so strict final
-  callback compatibility remains pending controller 2.1.2 HIL.
-- A dynamic visual-coordinate transform node, image-time/historical flange-pose synchronization,
-  and Driver hand-eye integration are not implemented.
+## Offline evidence inspected
 
-See `docs/hil/` for reviewed HIL evidence and exact limitations.
+The retained effective CTest configuration registers five core and two Driver targets.
+Their 2026-10-16 XML records contain **97 GTest cases, zero failures/errors**. These existing
+records were inspected, not rerun on 2026-10-24. Old `test_protected_arc_output` build artifacts
+are not current registered tests. There is no complete RobotRuntime/ROS Service integration test.
+The package manifests parse and the 79-file source/config/interface manifest from the 2026-10-16
+handoff still matches the current tracked code. This does not prove the exact revision used on hardware.
+
+## Limitations and remaining work
+
+- Stop at ten points in application input. **11-point HIL failed**; larger queue/worker refill
+  continuity is excluded from the current usage contract. Do not split a long queue and present
+  sequential Actions as verified continuous interpolation.
+- Existing 20/32-point FakeBackend test coverage is software evidence only, not supported HIL scope.
+- Vendor SDK calls are synchronous and uncancellable. IO caller waits are bounded by admission and
+  execution budgets plus scheduling; a permanently blocked worker can still block final destruction.
+  End-to-end ROS latency and command recovery faults are not all covered by the successful IO report.
+- YAML translation guard is **0.600 m**, while Node default is 0.05 m and YAML comment says 50 mm;
+  this inconsistency remains unchanged and must be checked before operation.
+- Health/recovery fault injection, MoveC/MoveS, queue failure diagnosis, Tool-change races and
+  synchronized visual transforms remain unverified unless separately supported by retained evidence.
+- Local `visual_heat_seam_moves*.py` and `Bd/hkhand_eye_matrix89.json` remain untracked and are not
+  part of this release/push, per operator instruction. Runtime SDK logs also remain local.
+
+See [queue usage](docs/FOLLOW_CARTESIAN_PATH.md), [ROS API](docs/ROS_API.md),
+[HIL checklist](docs/HIL_TEST_PLAN.md) and the [detailed source handoff](docs/handoff/HIKROBOT_DRIVER_FINAL_HIL_CODE_HANDOFF.md).

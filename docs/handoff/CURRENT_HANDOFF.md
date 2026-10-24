@@ -6,6 +6,20 @@ Purpose: establish the repository truth needed for later IO HIL and automatic co
 trajectory work. This document records the current implementation and reviewed historical evidence;
 it does not authorize or report a new controller connection or robot operation.
 
+## Current entry point — 2026-10-24
+
+**IO HIL succeeded on 2026-10-24; the eleven-point MoveL queue HIL failed**, per the operator.
+Current first-version usage is **1..10 points only**. The unchanged source still accepts 32;
+applications must apply the ten-point limit. Larger fake-backend tests are not supported HIL scope.
+See [current status](../hil/V1_STATUS_2026-10-24.md) and [queue usage](../FOLLOW_CARTESIAN_PATH.md).
+The operator did not supply raw logs or exact hardware-test build identity; no failure cause is inferred.
+
+Current production source baseline is `ae33fb7`; the earlier “uncommitted” statements below
+refer to their dated historical snapshots, not today's Git state. This documentation update does
+not include the untracked local visual scripts, hand-eye calibration sample or SDK runtime logs.
+Read the current status first, then the [2026-10-16 code audit](HIKROBOT_DRIVER_FINAL_HIL_CODE_HANDOFF.md)
+for detailed interfaces and risks. The remaining dated sections retain historical evidence.
+
 ## 2026-09-14 FollowCartesianPath Legacy queue-window repair
 
 **[User HIL report plus source repair]** On controller 2.1.2, a 20-target request preallocated and
@@ -218,9 +232,9 @@ segment. Rejection occurs before core execution, SDK Add, and PathID reservation
 
 | Name | Contract/status |
 | --- | --- |
-| `/hikrobot_driver/set_digital_output` | `(name, value)`, write requires ACTIVE; implemented, IO HIL deferred |
-| `/hikrobot_driver/get_digital_output` | `(name) -> value`, implemented, IO HIL deferred |
-| `/hikrobot_driver/get_digital_input` | `(name) -> value`, implemented, IO HIL deferred |
+| `/hikrobot_driver/set_digital_output` | `(name, value)`, write requires ACTIVE; IO HIL succeeded per operator 2026-10-24; raw case details pending |
+| `/hikrobot_driver/get_digital_output` | `(name) -> value`; current IO status is operator-confirmed success, no invented per-channel transcript |
+| `/hikrobot_driver/get_digital_input` | `(name) -> value`; current IO status is operator-confirmed success, no invented per-channel transcript |
 | `/hikrobot_driver/stop_motion` | requests `MP_StopRealTimeMotion`; not a safety-rated emergency stop |
 | `/hikrobot_driver/get_active_tool` | controller read-only query; refreshes successful active-Tool cache |
 | `/hikrobot_driver/get_tool_info_list` | controller read-only Tool-list query; does not switch Tools |
@@ -339,13 +353,14 @@ It is request-specific, stops after a failed goal, uses 50/100 mm clearances and
 and holds the initial TCP orientation. It is not a collision planner, continuous interpolator, or
 `FollowCartesianPath`. Its complete `NEAR_START -> MIDDLE -> NEAR_END` automatic HIL remains pending.
 
-## Known limitations and pending work
+## Historical limitations as of the original handoff (current status above takes precedence)
 
 - **[Deferred]** IO/DO HIL. The ROS/core paths exist, but safe channel naming, wiring, readback,
   fail-state, lifecycle, and physical-output behavior still require an approved HIL procedure.
 - **[Pending HIL]** MoveC and MoveS; current evidence is software-only.
-- **[Not implemented]** `FollowCartesianPath` and true continuous/interpolated visual trajectories.
-  Sending several MoveL goals sequentially is stop-to-stop sequencing, not continuous interpolation.
+- **[Updated 2026-10-24]** `FollowCartesianPath` is implemented but documented use is limited to
+  **1..10 points** after the failed eleven-point HIL. Online visual interpolation remains separate.
+  Sending several MoveL goals sequentially is stop-to-stop sequencing, not proof of continuous interpolation.
 - **[Not implemented]** Dynamic camera-to-Base transformation node, acquisition-time mapping, and
   historical flange-pose lookup.
 - **[Pending]** HAR stale-state fault injection and recovery verification.
@@ -401,7 +416,7 @@ lifetime and bounded process exit cannot both be achieved with the SDK API: Runt
 wait. Operational recovery therefore requires an external supervisor to allow a bounded graceful
 shutdown and then terminate/replace the whole process. The Driver does not automatically kill itself.
 
-## Next entry point: IO HIL
+## Historical IO HIL entry procedure (IO success reported 2026-10-24)
 
 Do not start by changing CMake or SDK discovery: the implemented path is already in
 `RobotRuntime::{set_digital_output,get_digital_output,get_digital_input}` and the three ROS Services.
@@ -411,7 +426,7 @@ wiring review, establish expected fail state, release teach-pendant control as a
 on an ON/read/OFF/read sequence with guaranteed OFF cleanup. Read-only DI/DO discovery should come
 before a write. Do not infer a safe channel name from old logs.
 
-## Next entry point: automatic continuous visual trajectory
+## Historical planning notes: automatic continuous visual trajectory
 
 Start from the strict Base TCP Action contract and the pure functions in
 `hikrobot_driver/cartesian_contract.*` and `hikrobot_mpsdk_core/tool_transform.*`. First define an

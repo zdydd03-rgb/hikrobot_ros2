@@ -1,6 +1,11 @@
-# ROS API (V0.2)
+# ROS API — first driver build
 
 Node name: `/hikrobot_driver`
+
+Updated 2026-10-24: IO HIL succeeded per the operator; the 11-point Legacy MoveL queue HIL
+failed. Current documented queue usage is **1..10 points only**. Source validation still accepts
+up to 32; this documentation update does not enforce runtime rejection above ten. Clients must
+limit requests accordingly. Detailed evidence: [current status](hil/V1_STATUS_2026-10-24.md).
 
 ## Actions
 
@@ -8,7 +13,7 @@ Node name: `/hikrobot_driver`
 - `/hikrobot_driver/move_l` — target `^B T_TCP` `PoseStamped` + `speed_percent`
 - `/hikrobot_driver/move_c` — via and target `^B T_TCP` poses + `speed_percent`
 - `/hikrobot_driver/move_s` — up to 49 via `^B T_TCP` poses plus final `^B T_TCP` + `speed_percent`
-- `/hikrobot_driver/follow_cartesian_path` — 1..32 ordered Base TCP poses, queued as one
+- `/hikrobot_driver/follow_cartesian_path` — **1..10 ordered Base TCP poses in current supported usage**, queued as one
   legacy MoveL sequence and started once. Goal fields are `poses`, `speed_percent`,
   `blend_radius` (SDK integer 0..10), and optional `timeout` (`0` keeps the driver default).
   All points are validated before PathID reservation. Feedback reports queueing/execution stage,
@@ -32,9 +37,11 @@ Tool before each Cartesian request, requires a flange-mounted Tool, and sends Ba
 Cartesian feedback `target_pose` and `actual_pose` are both TCP poses. Actual TCP and completion
 errors are calculated from one per-motion Tool snapshot as `^B T_F × ^F T_Tool`; position error
 is reported in metres and orientation error in radians. Input ROS m/quaternion is converted to
-SDK mm/ZYX Euler degree. The default first-HIL guard rejects any current-to-first or adjacent
-path segment over `max_cartesian_translation_step_m=0.05` or
-`max_cartesian_rotation_step_rad=0.1745329252` (10 degrees), before PathID allocation or Add.
+SDK mm/ZYX Euler degree. Cartesian guards run before PathID allocation or Add. The Node default
+translation threshold is 0.05 m, but the checked-in launch YAML actually sets
+`max_cartesian_translation_step_m=0.600` (600 mm), despite its 50 mm comment. Rotation is
+`max_cartesian_rotation_step_rad=0.1745329252` (10 degrees). Check effective parameters rather
+than relying on the stale comment; this update does not change configuration.
 
 ## Topics
 
@@ -139,16 +146,19 @@ lifecycle cleanup.
 
 `stop_confirmation_timeout_ms` defaults to 3000 ms and is a positive, bounded deadline independent
 of the Action timeout. After a post-Start timeout/cancel/failure, Stop success must be confirmed by
-a Motion callback newer than the snapshot taken when the Stop SDK call returned, stopped, and
+a Motion callback newer than the snapshot taken **before** the Stop SDK request, timestamped
+at or after that request, stopped, and
 matching the active PathID set. Confirmation preserves the original result code and failure stage. Stop SDK failure or stop
 confirmation timeout reports `STAGE_STOP` and sets the recovery lock. Result messages include the
 last compact completion snapshot. Failed PathID-collision attempts remain persisted/consumed but
 are omitted from `result.path_ids`, which describes only the complete final queue attempt.
 
 The strict Legacy final-completion rule remains final PathID + stopped + `nLeftPathNum == 0` + final
-target referenced by `nPreTargetID` or `nNextTargetID`, followed by distinct in-tolerance stopped
-HAR samples. Neither TCP arrival nor HAR stopped status alone is success, and controller 2.1.2
-`dPercent` is not used. This rule awaits raw callback evidence from a new HIL run.
+target referenced by `nPreTargetID` or `nNextTargetID` (or the implemented zero/zero target
+sentinel after an earlier matching running callback and with a newer terminal callback), followed
+by distinct in-tolerance stopped HAR samples. Neither TCP arrival nor HAR stopped status alone is success, and controller 2.1.2
+`dPercent` is not used. The eleven-point HIL failed; complete raw callback evidence is
+needed to diagnose it. Current use remains limited to ten points.
 
 ## Lifecycle
 
