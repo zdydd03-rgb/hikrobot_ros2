@@ -220,6 +220,16 @@ class QuickDeployTests(unittest.TestCase):
             self.assertNotIn(self.password, output.getvalue())
             self.assertEqual(self.bashrc.exists(), exists)
         self.assertIn(deploy.BEGIN, self.bashrc.read_text())
+        # A copied build hint must keep an SDK path with spaces as one -D argument.
+        command = next(line.strip() for line in output.getvalue().splitlines()
+                       if line.strip().startswith('colcon build '))
+        stub = ('colcon() { python3 -c '
+                "'import sys,json;print(json.dumps(sys.argv[1:]))' \"$@\"; }; ")
+        env = os.environ.copy()
+        env['HIKROBOT_MPSDK_ROOT'] = str(self.sdk)
+        result = subprocess.run(['bash', '--noprofile', '--norc', '-c', stub + command],
+                                env=env, capture_output=True, text=True, check=True)
+        self.assertIn('-DHIKROBOT_MPSDK_ROOT=' + str(self.sdk), json.loads(result.stdout))
 
     def test_password_mismatch_reprompts_without_printing_values(self):
         output = io.StringIO()

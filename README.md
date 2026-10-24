@@ -15,7 +15,7 @@ source ~/.bashrc
 
 工具自动搜索/校验SDK、隐藏输入并确认PROGRAMMER密码，将配置保存到用户bashrc，之后新开的交互式Bash自动加载。
 密码按要求明文保存，bashrc及备份权限为0600，工具不会显示密码。首次仍需安装依赖和构建；
-它不启动Driver、不连接硬件。参数、备份和手动部署步骤见[部署指南](DEPLOYMENT.md)。
+它不启动Driver、不连接硬件。接下来还需构建5包、source安装环境、验链接/离线测试、审核本机YAML，再手动Launch/Configure/Activate。完整命令见[首次部署到日常启动](DEPLOYMENT.md#配置完成后首次部署到日常启动)。参数和备份说明仍在部署指南中。
 
 ## 当前版本范围
 

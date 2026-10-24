@@ -319,8 +319,22 @@ def main(argv=None):
         print('原文件备份:', backup)
     print('当前父终端不会被子进程自动修改。请执行：')
     print('  source ' + shlex.quote(str(target)))
-    print('之后新开的交互式Bash会自动加载；首次构建后当前终端再source一次install/setup.bash。')
-    print('本工具不安装系统依赖、不构建包、不启动Driver、不连接控制器。')
+    print('之后新开的交互式Bash会自动加载。接下来按顺序完成：')
+    print('1. 若ROS/系统依赖尚未安装，先按DEPLOYMENT.md第1节安装。')
+    print('2. 构建机械臂5包（SDK变量已保存，不需要再输入密码）：')
+    print('  cd "$HIKROBOT_WS"')
+    print('  colcon build --packages-up-to hikrobot_bringup --executor sequential '
+          '--cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=ON '
+          '"-DHIKROBOT_MPSDK_ROOT=$HIKROBOT_MPSDK_ROOT"')
+    print('  source "$HIKROBOT_WS/install/setup.bash"')
+    print('3. 按部署文档检查core/Driver的ldd、ldd -r，再运行离线测试：')
+    print('  colcon test --packages-select hikrobot_mpsdk_core hikrobot_driver')
+    print('  colcon test-result --verbose')
+    print('  python3 -m unittest discover -s tests -p test_quick_deploy.py -v')
+    print('4. 复制并审核本机YAML：IP/port、Tool、步长保护和PathID路径。')
+    print('5. 仅现场确认后，按文档手动启动Driver、Configure、Activate；Activate会上电。')
+    print('完整命令见DEPLOYMENT.md的“配置完成后：首次部署到日常启动”。')
+    print('上述仅为下一步提示，本工具未安装依赖、构建包、启动Driver或连接控制器。')
     return 0
 
 

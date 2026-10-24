@@ -50,6 +50,119 @@ python3 tools/quick_deploy.py --dry-run
 首次仍需按下文安装依赖、构建；构建完成后当前终端执行`source install/setup.bash`，此后新终端会自动加载。
 非交互shell、systemd、容器不会因为用户bashrc已更新就自动得到配置，仍须显式配置服务环境。
 
+## 配置完成后：首次部署到日常启动
+
+`quick_deploy.py`完成的是**环境和密码持久化**，还不是ROS包编译或机器人连接。下面将首次部署的剩余步骤串起来；所有命令由操作者手动执行，工具不会自动运行。若尚未安装ROS/依赖，先完成第1节，再继续。
+
+### A. 让当前终端加载已保存配置
+
+```bash
+source ~/.bashrc
+cd "$HIKROBOT_WS"
+command -v ros2
+command -v colcon
+```
+
+使用了`--bashrc`时source那个文件。不要用`echo`打印密码；不需要再次输入密码。配置中的workspace必须是当前要构建的机械臂仓库。若SDK、工作空间位置或密码改变，重跑工具更新受管区块。
+
+### B. 首次构建机械臂ROS包
+
+```bash
+colcon build --packages-up-to hikrobot_bringup \
+  --executor sequential --event-handlers console_direct+ \
+  --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=ON \
+  "-DHIKROBOT_MPSDK_ROOT=$HIKROBOT_MPSDK_ROOT"
+source "$HIKROBOT_WS/install/setup.bash"
+```
+
+应看到5个包构建成功。工具运行时若还没有install，会跳过它；因此首次构建后，当前终端必须source一次。以后新开的交互式Bash会加载已生成的标准install。采用其它安装目录时需显式source其setup。
+
+### C. 检查刚编译出的包和SDK链接
+
+```bash
+export HIKROBOT_CORE_PREFIX="$(ros2 pkg prefix hikrobot_mpsdk_core)"
+export HIKROBOT_DRIVER_PREFIX="$(ros2 pkg prefix hikrobot_driver)"
+ldd -r "$HIKROBOT_CORE_PREFIX/lib/libhikrobot_mpsdk_core.so"
+ldd "$HIKROBOT_DRIVER_PREFIX/lib/hikrobot_driver/hikrobot_driver_node"
+```
+
+prefix应属于本次install；解析出的SDK应是工具选择的目录，不能出现`not found`或`undefined symbol`。工具运行前检查的是SDK库本身，这一步另检查新生成的core/Driver，二者不能相互替代。此步骤不连接机器人。
+
+### D. 跑离线测试
+
+```bash
+colcon test --packages-select hikrobot_mpsdk_core hikrobot_driver \
+  --event-handlers console_direct+
+colcon test-result --verbose
+python3 -m unittest discover -s tests -p test_quick_deploy.py -v
+```
+
+当前有效范围是机械臂7个CTest/97个GTest和快速配置工具18个Python测试。检查测试结果，不能只看`colcon test`是否结束；旧build可能有历史XML。离线通过不代替现场HIL。
+
+### E. 准备本机机器人参数文件
+
+```bash
+mkdir -p "$HOME/.config/hikrobot_driver"
+cp -n "$(ros2 pkg prefix hikrobot_bringup)/share/hikrobot_bringup/config/hikrobot_driver.yaml" \
+  "$HOME/.config/hikrobot_driver/driver.yaml"
+```
+
+`cp -n`保留已有配置，后续不覆盖现场参数。用编辑器审核该文件，至少检查：
+
+- `robot_ip`、`robot_port`为实际控制器地址；工具不会自动发现控制器IP或验证密码登录。
+- 六轴`joint_names`、`base_frame`、控制器Active Tool及安装位置匹配现场。
+- 平移/旋转保护、容差和timeout经过确认；随包平移值实际0.600m，旧50mm注释不能当作生效值。
+- `sequence_state_file`、HOME和运行用户稳定；保留真实PathID文件，不删除、清零或回退，只运行一个分配进程。
+- `programmer_password_env`保持与工具保存的`HIKROBOT_PROGRAMMER_PASSWORD`一致。
+- 本版MoveL队列按1～10点使用，11点HIL失败；源码32点准入尚未收紧。
+
+所有参数释义在README，第6节说明自定义配置和部署环境。
+
+### F. 现场启动与手动激活
+
+确认网络、控制器状态、示教器控制权和现场操作条件。终端1启动：
+
+```bash
+ros2 launch hikrobot_bringup hikrobot_driver.launch.py \
+  "config_file:=$HOME/.config/hikrobot_driver/driver.yaml"
+```
+
+这里只启动unconfigured节点。终端2使用同一用户的新交互式Bash（自动读取bashrc）；若没有自动加载，手动source配置：
+
+```bash
+ros2 lifecycle get /hikrobot_driver
+ros2 param dump /hikrobot_driver
+# Configure从这里开始真实连接SDK/控制器，等待HAR并加载工具
+ros2 lifecycle set /hikrobot_driver configure
+ros2 service call /hikrobot_driver/get_active_tool hikrobot_msgs/srv/GetActiveTool '{}'
+# 现场确认后才执行：Activate申请控制权、PROGRAMMER登录、AUTO并上电
+ros2 lifecycle set /hikrobot_driver activate
+ros2 topic echo /hikrobot_driver/status --once
+ros2 topic echo /hikrobot_driver/flange_pose --once
+ros2 topic echo /hikrobot_driver/tcp_pose --once
+```
+
+每次先确认上一步成功，再执行下一步。INACTIVE没有这些状态Topic的新数据；密码是否正确、控制权是否可申请，要到真实Activate才知道。工具保存成功不是登录成功。
+
+### G. API验收与结束
+
+ACTIVE、状态新鲜、工具正确后，按README使用只读接口、现场批准的IO和运动目标。不要使用假设坐标。标准Action Cancel、Service Stop和最终物理静止需分别确认。
+
+```bash
+ros2 service call /hikrobot_driver/stop_motion hikrobot_msgs/srv/StopMotion '{}'
+ros2 lifecycle set /hikrobot_driver deactivate
+ros2 lifecycle set /hikrobot_driver cleanup
+ros2 lifecycle get /hikrobot_driver
+```
+
+正常清理后再结束终端1的Launch。若进入Command Recovery，不能把Cleanup成功等同于硬件已释放；按README的恢复边界处理，不自动重发运动或未知结果的DO。
+
+### H. 以后每天如何启动
+
+首次构建、参数审核和验收完成后，同一机器、同一SDK/工作空间路径下无需每天重跑工具、重新输入密码或重编译。新开终端直接用F中的Launch命令，另一终端手动Configure/Activate；结束时按G清理。
+
+改变源码/接口后重建；改变SDK后更新工具配置、显式传`-D`重建并重新验链接；改变密码或工作空间位置后重新运行工具。systemd、容器和不读取bashrc的shell仍需显式配置环境。
+
 ## 1. 获取源码与准备环境
 
 从GitHub的 **main** 获取当前机械臂版本。以下使用新的目录 `hikrobot_ros2_arm`，名称可以自选；不会覆盖已有工作空间。在已安装ROS 2 Humble的机器上：
