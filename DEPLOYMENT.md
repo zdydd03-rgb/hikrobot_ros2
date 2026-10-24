@@ -4,6 +4,52 @@
 
 目标环境是Ubuntu 22.04、ROS 2 Humble、Linux x86_64。机械臂当前vendor shim使用SDK内的`Libs/Linux/LX64/64`布局，不因此承诺ARM兼容。MPSDK由设备供应商单独提供，本仓库不分发。**SDK可以放在任意可读目录**；下面通过用户输入和CMake参数绑定，不要求`/home/ai/SDK`或`/opt`下某个位置。
 
+## 快速配置：自动找SDK并永久保存环境
+
+`export`只修改当前shell及其子进程；写入bashrc后，新开的交互式Bash才会自动获得配置。
+已有完整机械臂SDK和Python 3时，在仓库根目录运行：
+
+```bash
+python3 tools/quick_deploy.py
+source ~/.bashrc
+```
+
+工具会依次：
+
+1. 优先检查当前`HIKROBOT_MPSDK_ROOT`/`MPSDK_ROOT`，再搜索用户主目录、`/opt`、
+   `/usr/local`、`/mnt`、`/media`，最多向下6层，跳过缓存/构建目录；列出SDK供选择，未找到可手动输入。
+2. 校验机械臂SDK所需头文件、x86_64 ELF主库，并执行`ldd -r`依赖检查；不会选择相机SDK。
+3. 隐藏输入两次PROGRAMMER密码，检查一致且UTF-8长度小于64字节。这里保存的是Driver实际使用的
+   **PROGRAMMER账户密码**，不能假定其它管理员账户的密码也能登录。
+4. 展示目标路径并确认后，在`~/.bashrc`专属标记区块保存SDK、工作空间和密码；重复运行更新同一区块。
+   保留其它配置，原文件备份为同目录下`.bashrc.hikrobot-*.bak`。文件及备份权限均为0600。
+5. 让以后新开的交互式Bash条件加载ROS和该工作空间标准`install/setup.bash`（存在时），
+   导出`MPSDK_ROOT/INC/LIB`、`HIKROBOT_MPSDK_ROOT/LIBDIR`、`HIKROBOT_WS`和密码；重复source不会重复添加所选SDK库路径。
+
+**按本项目的需求，密码明文保存在bashrc中，不会显示在工具输出或写入仓库。** 请勿上传bashrc及备份。
+工具不读取旧密码作为默认值，不运行你的bashrc，也不自动修改当前父终端；因此完成后要手动
+`source ~/.bashrc`一次。之后新开交互式Bash无需重复输入。原有手写export保留，不要在受管区块后再次覆盖这些变量。
+
+指定搜索目录、SDK或预览：
+
+```bash
+# 增加SDK解压位置的搜索范围
+python3 tools/quick_deploy.py --search-root /你存放SDK的目录
+# 已知SDK路径时直接校验并配置，密码仍隐藏输入
+python3 tools/quick_deploy.py --sdk-root /你实际的SDK根目录
+# 交互检查但不保存密码、不写bashrc或备份
+python3 tools/quick_deploy.py --dry-run
+```
+
+高级选项：`--workspace`指定工作空间，`--ros-setup`指定ROS setup文件，`--bashrc`指定其它Bash配置文件。
+默认工作空间取工具所在仓库，默认ROS setup为`/opt/ros/humble/setup.bash`。普通用户运行，**不要sudo**。
+若SDK或工作空间搬迁，重新运行工具；若SDK改变，还要按第3节显式`-D`重新构建，不能只改bashrc。
+自定义`install_robot_redeploy`等安装目录不会自动加载，仍需source该目录setup。
+
+工具只持久化环境：不安装系统依赖、不下载SDK、不编译ROS包、不启动Driver、不连接控制器。
+首次仍需按下文安装依赖、构建；构建完成后当前终端执行`source install/setup.bash`，此后新终端会自动加载。
+非交互shell、systemd、容器不会因为用户bashrc已更新就自动得到配置，仍须显式配置服务环境。
+
 ## 1. 获取源码与准备环境
 
 在已安装ROS 2 Humble的机器上：
@@ -47,7 +93,10 @@ rosdep install --from-paths \
 向供应商取得与控制器匹配的Linux x86_64完整MPSDK并解压。历史使用版本为`V2.4.0 Build20251106 SVN1686294`。选择的是SDK根目录，即同时包含`Include`和`Libs`的那层，不是zip文件、`Include/Public`或单个`.so`。
 
 ```bash
-read -r -p 'MPSDK根目录的实际路径: ' HIKROBOT_MPSDK_ROOT
+# 快速工具已配置时保留现有值；以下也可作为手动部署入口
+if [ -z "${HIKROBOT_MPSDK_ROOT:-}" ]; then
+  read -r -p 'MPSDK根目录的实际路径: ' HIKROBOT_MPSDK_ROOT
+fi
 export HIKROBOT_MPSDK_ROOT="$(realpath -e -- "$HIKROBOT_MPSDK_ROOT")"
 export HIKROBOT_MPSDK_LIBDIR="$HIKROBOT_MPSDK_ROOT/Libs/Linux/LX64/64"
 ```
@@ -94,7 +143,7 @@ ldd "$HIKROBOT_MPSDK_LIBDIR/libMPSDK_PUBLIC_COMPAT.so"
 
 ## 3. 构建机械臂包
 
-在新的构建终端，只source系统ROS，不预先source其它旧工作空间。回到本仓库，并保留上节的SDK变量：
+在构建终端避免叠加其它项目的旧工作空间。快速工具可能已加载本项目标准install；SDK变化时必须显式传入下面的`-D`并重建。回到本仓库，并保留上节的SDK变量：
 
 ```bash
 cd "$HIKROBOT_WS"
@@ -174,6 +223,12 @@ colcon test-result --verbose
 
 现有源码注册core5个、Driver2个CTest目标，共97个GTest。旧build可能残留已删除的`test_protected_arc_output` XML；清点当前注册目标，不能把所有历史XML合计当作本次结果。采用新build目录时相应给`colcon test --build-base ... --install-base ...`和ctest替换路径。
 
+快速配置工具有独立的Python标准库测试，全部使用临时bashrc/模拟密码，不属于上面的97个GTest：
+
+```bash
+python3 -m unittest discover -s tests -p test_quick_deploy.py -v
+```
+
 根目录独立PathID测试需另编译（不带`-DNDEBUG`，以保持assert有效），只使用自己的临时state，不接触真实`~/.ros/hikrobot/path_id.state`；不要并行运行多个同名测试：
 
 ```bash
@@ -208,10 +263,12 @@ YAML顶层节点key默认是`hikrobot_driver`，参数放在`ros__parameters`下
 - watchdog大于lock timeout；启用health时通信阈值至少3个check周期、10个HAR周期。
 - 当前仅支持按文档<=10点使用，代码尚未强制收紧32点准入。
 
-密码用环境变量，不写入仓库/YAML：
+密码通过环境变量提供。快速工具已写入用户bashrc时直接沿用；手动部署时可临时隐藏输入，不写入仓库/YAML：
 
 ```bash
-read -r -s -p 'PROGRAMMER password: ' HIKROBOT_PROGRAMMER_PASSWORD
+if [ -z "${HIKROBOT_PROGRAMMER_PASSWORD:-}" ]; then
+  read -r -s -p 'PROGRAMMER password: ' HIKROBOT_PROGRAMMER_PASSWORD
+fi
 export HIKROBOT_PROGRAMMER_PASSWORD
 ros2 launch hikrobot_bringup hikrobot_driver.launch.py \
   "config_file:=$HIKROBOT_DRIVER_CONFIG"
@@ -297,3 +354,8 @@ g++ -std=c++17 -Wall -Wextra -Wpedantic tools/tool_readonly_probe.cpp \
 沙箱内colcon曾停在CMake已完成的配置阶段，非沙箱重跑构建/测试正常；这是本轮工具执行
 环境的现象，不据此修改Driver。SDK根路径别名验证不等于所有SDK版本、架构或新控制器都通过。
 本次没有运行Driver/Tool probe、连接硬件、执行运动/IO或访问真实PathID状态文件。
+
+快速配置工具的补充验证：18个Python离线用例全部通过，覆盖SDK发现、格式校验、隐藏输入流程、
+取消/预览、备份与0600权限、受管区块更新、保留旧内容、符号链接以及特殊字符防命令展开。
+另在真实终端使用模拟密码完成`--dry-run`，实际SDK的自动发现与`ldd -r`检查通过，
+未修改当前用户bashrc，未保存真实密码。机械臂97个GTest是前述独立构建结果，未因工具变更重复运行。

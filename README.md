@@ -4,6 +4,19 @@
 
 安装、选择任意位置的 MPSDK、编译与动态库检查统一见 [部署指南](DEPLOYMENT.md)。本仓库当前只维护这两份说明文档；历史开发记录保留在 Git 历史中。
 
+## 快速配置环境
+
+已有Python 3和完整机械臂SDK时，在仓库根目录运行：
+
+```bash
+python3 tools/quick_deploy.py
+source ~/.bashrc
+```
+
+工具自动搜索/校验SDK、隐藏输入并确认PROGRAMMER密码，将配置保存到用户bashrc，之后新开的交互式Bash自动加载。
+密码按要求明文保存，bashrc及备份权限为0600，工具不会显示密码。首次仍需安装依赖和构建；
+它不启动Driver、不连接硬件。参数、备份和手动部署步骤见[部署指南](DEPLOYMENT.md)。
+
 ## 当前版本范围
 
 | 项目 | 状态与证据 |
@@ -47,6 +60,7 @@ ROS 2 Application / CLI
 
 | 路径 | 处理与理由 |
 |---|---|
+| `tools/quick_deploy.py`、`tests/test_quick_deploy.py` | 保留：机械臂SDK/密码持久化配置及临时文件离线测试 |
 | `tests/test_sequence_manager.cpp` | 保留：独立 PathID 持久化、重建与耗尽回归；尚未注册为 package CTest |
 | `tools/tool_readonly_probe.cpp` | 保留并扁平化：独立 SDK 只读 Tool 诊断，可区分 SDK 与 ROS 问题；不随 Driver 自动运行 |
 | 原 `docs/`、`IMPLEMENTATION_STATUS.md`、子目录 README | 内容整合到这两份文档，移除重复入口；原文可在 Git 历史查回 |
