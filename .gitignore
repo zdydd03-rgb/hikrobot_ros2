@@ -5,3 +5,12 @@ _build*/
 *.o
 *.so
 __pycache__/
+
+# Vendor-generated runtime logs
+/Mv3dRgbdLog/
+/MvSdkLog/
+
+# Optional isolated robot redeployment trees from DEPLOYMENT.md
+/build_robot_*/
+/install_robot_*/
+/log_robot_*/
